@@ -19,7 +19,7 @@ const setAuth = (v) => { try { v ? localStorage.setItem(AUTH_KEY, v) : localStor
 class UnauthorizedError extends Error { constructor() { super("unauthorized"); this.code = 401; } }
 
 async function dbFetchAll() {
-  const url = SHEETS_URL + "?auth=" + encodeURIComponent(getAuth());
+  const url = SHEETS_URL + "?k=" + encodeURIComponent(getAuth());
   const res = await fetch(url, { method: "GET", redirect: "follow" });
   const text = await res.text();
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0,200)}`);
@@ -43,7 +43,7 @@ async function dbWrite(key, value) {
   const res = await fetch(SHEETS_URL, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify({ key, value, auth: getAuth() }),
+    body: JSON.stringify({ key, value, k: getAuth() }),
     redirect: "follow",
   });
   const text = await res.text();
@@ -2173,7 +2173,7 @@ function PasscodeGate({ onUnlock }) {
     if (!pc.trim()) return;
     setBusy(true); setErr(null);
     try {
-      const url = SHEETS_URL + "?auth=" + encodeURIComponent(pc);
+      const url = SHEETS_URL + "?k=" + encodeURIComponent(pc);
       const res = await fetch(url, { method: "GET", redirect: "follow" });
       const text = await res.text();
       if (text.trim().startsWith("<")) throw new Error("Backend unreachable");

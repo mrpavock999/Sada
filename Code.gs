@@ -254,7 +254,7 @@ function unauthorized_() {
 
 function doGet(e) {
   try {
-    const auth = e && e.parameter && e.parameter.auth;
+    const auth = e && e.parameter && e.parameter.k;
     if (!checkAuth_(auth)) return unauthorized_();
     return jsonOut_({
       entries: readEntries_(),
@@ -272,9 +272,9 @@ function doPost(e) {
       return jsonOut_({ error: "Empty request body" });
     }
     const body = JSON.parse(e.postData.contents);
-    if (!checkAuth_(body && body.auth)) return unauthorized_();
+    if (!checkAuth_(body && body.k)) return unauthorized_();
     if (!body || typeof body.key !== "string") {
-      return jsonOut_({ error: "Body must be { key, value, auth }" });
+      return jsonOut_({ error: "Body must be { key, value, k }" });
     }
     switch (body.key) {
       case "schema":  writeSchema_(body.value);   break;
