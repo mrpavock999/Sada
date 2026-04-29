@@ -236,8 +236,26 @@ function writeMeta_(key, value) {
 }
 
 /* ─────────────── HTTP handlers ─────────────── */
+
+/**
+ * Shared-secret check. Set the secret once via the Apps Script editor:
+ *   File ▸ Project Settings ▸ Script Properties ▸ Add “APP_SECRET” → your passcode
+ * Or run this from the editor:  PropertiesService.getScriptProperties().setProperty('APP_SECRET','your-passcode');
+ * If APP_SECRET is unset the API stays open (back-compat for first-time setup).
+ */
+function checkAuth_(provided) {
+  const expected = PropertiesService.getScriptProperties().getProperty("APP_SECRET");
+  if (!expected) return true;            // not configured → open (so you can do first-time setup)
+  return String(provided || "") === String(expected);
+}
+function unauthorized_() {
+  return jsonOut_({ error: "unauthorized", code: 401 });
+}
+
 function doGet(e) {
   try {
+    const auth = e && e.parameter && e.parameter.auth;
+    if (!checkAuth_(auth)) return unauthorized_();
     return jsonOut_({
       entries: readEntries_(),
       schema:  readSchema_(),
@@ -254,8 +272,9 @@ function doPost(e) {
       return jsonOut_({ error: "Empty request body" });
     }
     const body = JSON.parse(e.postData.contents);
+    if (!checkAuth_(body && body.auth)) return unauthorized_();
     if (!body || typeof body.key !== "string") {
-      return jsonOut_({ error: "Body must be { key, value }" });
+      return jsonOut_({ error: "Body must be { key, value, auth }" });
     }
     switch (body.key) {
       case "schema":  writeSchema_(body.value);   break;

@@ -7,14 +7,22 @@ import {
  * No local fallback. Every read/write hits the Sheet. Errors are surfaced.
  * POST uses Content-Type: text/plain to avoid CORS preflight (Apps Script
  * cannot respond to OPTIONS). The Apps Script reads e.postData.contents as JSON.
+ *
+ * AUTH: every request carries a shared-secret passcode. Apps Script rejects
+ * mismatches with HTTP 200 + { error:"unauthorized" }. The passcode lives in
+ * localStorage; the gate component below collects it on first load.
  */
 const SHEETS_URL = "https://script.google.com/macros/s/AKfycbzaxRUVz7vRqDw6Mf0-xowdLhc9rEVWGSJTzrsoBvOSHPrE7h8uB0zzxWeUI1hq0_pQeQ/exec";
+const AUTH_KEY = "ht_auth_v1";
+const getAuth = () => { try { return localStorage.getItem(AUTH_KEY) || ""; } catch { return ""; } };
+const setAuth = (v) => { try { v ? localStorage.setItem(AUTH_KEY, v) : localStorage.removeItem(AUTH_KEY); } catch {} };
+class UnauthorizedError extends Error { constructor() { super("unauthorized"); this.code = 401; } }
 
 async function dbFetchAll() {
-  const res = await fetch(SHEETS_URL, { method: "GET", redirect: "follow" });
+  const url = SHEETS_URL + "?auth=" + encodeURIComponent(getAuth());
+  const res = await fetch(url, { method: "GET", redirect: "follow" });
   const text = await res.text();
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0,200)}`);
-  // Apps Script error pages come back as HTML 200s — detect that.
   if (text.trim().startsWith("<")) {
     const m = text.match(/TypeError[^<]*|Error[^<]*/);
     throw new Error(`Apps Script error: ${m ? m[0] : "returned HTML, not JSON"}`);
@@ -22,6 +30,7 @@ async function dbFetchAll() {
   let json;
   try { json = JSON.parse(text); }
   catch { throw new Error("Sheet returned non-JSON response"); }
+  if (json && json.error === "unauthorized") throw new UnauthorizedError();
   return {
     entries: Array.isArray(json.entries) ? json.entries : [],
     schema:  Array.isArray(json.schema)  ? json.schema  : null,
@@ -34,7 +43,7 @@ async function dbWrite(key, value) {
   const res = await fetch(SHEETS_URL, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify({ key, value }),
+    body: JSON.stringify({ key, value, auth: getAuth() }),
     redirect: "follow",
   });
   const text = await res.text();
@@ -43,7 +52,10 @@ async function dbWrite(key, value) {
     const m = text.match(/TypeError[^<]*|Error[^<]*/);
     throw new Error(`Apps Script error: ${m ? m[0] : "returned HTML, not JSON"}`);
   }
-  try { return JSON.parse(text); } catch { return { ok:true }; }
+  let json;
+  try { json = JSON.parse(text); } catch { return { ok:true }; }
+  if (json && json.error === "unauthorized") throw new UnauthorizedError();
+  return json;
 }
 
 /* ─────────────── PALETTE ─────────────── */
@@ -2146,6 +2158,103 @@ function SyncBadge({ sync }) {
   );
 }
 
+/* ─────────────── PASSCODE GATE ───────────────
+ * Front-door for the app. Verifies the passcode by hitting the Sheets backend,
+ * which holds the real secret in Script Properties (APP_SECRET). The passcode
+ * is stored in localStorage and sent with every request after unlock.
+ */
+function PasscodeGate({ onUnlock }) {
+  const [pc, setPc] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const submit = async (e) => {
+    e?.preventDefault?.();
+    if (!pc.trim()) return;
+    setBusy(true); setErr(null);
+    try {
+      const url = SHEETS_URL + "?auth=" + encodeURIComponent(pc);
+      const res = await fetch(url, { method: "GET", redirect: "follow" });
+      const text = await res.text();
+      if (text.trim().startsWith("<")) throw new Error("Backend unreachable");
+      const json = JSON.parse(text);
+      if (json && json.error === "unauthorized") {
+        setErr("Wrong passcode");
+        return;
+      }
+      onUnlock(pc);
+    } catch (e) {
+      setErr(e.message || "Could not verify");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{
+      minHeight:"100vh", background:"#08080f", color:"#e2e8f0",
+      display:"flex", alignItems:"center", justifyContent:"center",
+      padding:20, fontFamily:"'Inter',system-ui,sans-serif",
+    }}>
+      <form onSubmit={submit} style={{
+        width:"100%", maxWidth:380,
+        background:"#0f0f1a", border:"1px solid #1e1e30", borderRadius:18,
+        padding:"28px 24px", boxShadow:"0 24px 64px rgba(0,0,0,.5)",
+        display:"flex", flexDirection:"column", gap:14,
+      }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10, justifyContent:"center" }}>
+          <span style={{ fontSize:28, filter:"drop-shadow(0 0 12px #06b6d488)" }}>⚡</span>
+          <span style={{
+            fontFamily:"'Space Grotesk',sans-serif", fontSize:22, fontWeight:800, letterSpacing:2,
+            background:"linear-gradient(135deg,#06b6d4,#8b5cf6)",
+            WebkitBackgroundClip:"text", backgroundClip:"text", WebkitTextFillColor:"transparent",
+          }}>DISCIPLINE</span>
+        </div>
+        <div style={{ textAlign:"center", color:"#64748b", fontSize:13, lineHeight:1.5 }}>
+          Enter your passcode to unlock the tracker.
+        </div>
+        <input
+          type="password"
+          autoFocus
+          inputMode="text"
+          autoComplete="current-password"
+          placeholder="Passcode"
+          value={pc}
+          onChange={e => { setPc(e.target.value); setErr(null); }}
+          disabled={busy}
+          style={{
+            background:"#191930", border:`1.5px solid ${err ? "#f43f5e" : "#25253a"}`,
+            color:"#e2e8f0", padding:"12px 14px", borderRadius:10,
+            fontSize:15, fontFamily:"inherit", outline:"none",
+            transition:"border-color .2s",
+          }}
+        />
+        {err && (
+          <div style={{ color:"#f43f5e", fontSize:12, fontWeight:600, textAlign:"center" }}>
+            ⚠️ {err}
+          </div>
+        )}
+        <button
+          type="submit"
+          disabled={busy || !pc.trim()}
+          style={{
+            background: busy ? "#25253a" : "linear-gradient(135deg,#7c3aed,#8b5cf6)",
+            color:"#fff", border:"none", padding:"12px 16px", borderRadius:10,
+            fontWeight:800, letterSpacing:.5, fontSize:14, cursor: busy ? "wait" : "pointer",
+            boxShadow: busy ? "none" : "0 8px 24px #8b5cf688",
+            fontFamily:"inherit", textTransform:"uppercase",
+          }}
+        >
+          {busy ? "Verifying…" : "Unlock"}
+        </button>
+        <div style={{ fontSize:11, color:"#4a5568", textAlign:"center", lineHeight:1.5 }}>
+          The passcode is stored only on this device.
+        </div>
+      </form>
+    </div>
+  );
+}
+
 export default function App() {
   const [tab, setTab] = useState("dashboard");
   const [menuOpen, setMenuOpen] = useState(false);
@@ -2162,9 +2271,15 @@ export default function App() {
   const [, setThemeVersion] = useState(0);
   // Day-detail modal: { ds: "YYYY-MM-DD" } | null
   const [dayDetail, setDayDetail] = useState(null);
+  // Auth gate: shown when no passcode yet, or after a 401 from the backend.
+  const [locked, setLocked] = useState(() => !getAuth());
+
+  // Re-trigger boot fetch when the user unlocks.
+  const [bootNonce, setBootNonce] = useState(0);
 
   // Load EVERYTHING from the sheet on mount.
   useEffect(() => {
+    if (locked) return; // wait until passcode is entered
     // Purge legacy localStorage from previous versions so it can't shadow Sheet truth.
     try {
       localStorage.removeItem("habit_entries_v3");
@@ -2192,12 +2307,19 @@ export default function App() {
         }
         setSync({ state: "saved", msg: `Synced · ${e.length} entries`, ts: Date.now() });
       } catch (err) {
+        if (err && err.code === 401) {
+          // Bad / missing passcode — lock the UI.
+          setAuth("");
+          setLocked(true);
+          setSync({ state: "error", msg: "Wrong passcode" });
+          return;
+        }
         console.error(err);
         setBootError(err.message || String(err));
         setSync({ state: "error", msg: err.message || "Load failed" });
       }
     })();
-  }, []);
+  }, [locked, bootNonce]);
 
   // Mutate global palette + persist theme to sheet.
   const updateTheme = async (next) => {
@@ -2209,6 +2331,7 @@ export default function App() {
       await dbWrite("theme", next);
       setSync({ state: "saved", msg: "Theme synced", ts: Date.now() });
     } catch (err) {
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
       console.error(err);
       setSync({ state: "error", msg: err.message || "Theme save failed" });
     }
@@ -2223,6 +2346,7 @@ export default function App() {
       await dbWrite("schema", next);
       setSync({ state: "saved", msg: "Schema synced", ts: Date.now() });
     } catch (err) {
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
       console.error(err);
       setSync({ state: "error", msg: err.message || "Schema save failed" });
     }
@@ -2245,6 +2369,7 @@ export default function App() {
       setSync({ state: "saved", msg: `Synced · ${updated.length} entries`, ts: Date.now() });
       setTimeout(() => { setSaved(false); setTab("dashboard"); }, 1200);
     } catch (err) {
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
       console.error(err);
       setSync({ state: "error", msg: err.message || "Save failed" });
       alert(`Save FAILED — not stored in Sheet.\n\n${err.message || err}\n\nFix the Apps Script and try again.`);
@@ -2274,6 +2399,7 @@ export default function App() {
       await dbWrite("entries", rescored);
       setSync({ state: "saved", msg: `Imported · ${rescored.length} entries`, ts: Date.now() });
     } catch (err) {
+      if (err && err.code === 401) { setAuth(""); setLocked(true); throw err; }
       console.error(err);
       setSync({ state: "error", msg: err.message || "Import failed" });
       throw err;
@@ -2313,6 +2439,15 @@ export default function App() {
     { k:"engine",    label:"Engine",    icon:"⚙️" },
     { k:"settings",  label:"Settings",  icon:"🎨" },
   ];
+
+  if (locked) {
+    return <PasscodeGate onUnlock={(pc) => {
+      setAuth(pc);
+      setLocked(false);
+      setBootError(null);
+      setBootNonce(n => n + 1);
+    }}/>;
+  }
 
   return (
     <div style={{ background:C.bg, minHeight:"100vh", color:C.text, paddingBottom:60 }}>
@@ -2383,6 +2518,11 @@ export default function App() {
             <SyncBadge sync={sync}/>
             <span className="ht-date-pill">{fmtShort(getToday())}</span>
             <button onClick={() => setInfo(true)} className="ht-info-btn" title="How scoring works">i</button>
+            <button
+              onClick={() => { if (confirm("Lock the app? You'll need the passcode to unlock.")) { setAuth(""); setLocked(true); } }}
+              className="ht-info-btn" title="Lock"
+              style={{ borderColor: `${C.muted}66`, background: `${C.muted}11`, color: C.muted, fontStyle:"normal", fontFamily:"inherit" }}
+            >🔒</button>
           </div>
         </div>
       </header>
