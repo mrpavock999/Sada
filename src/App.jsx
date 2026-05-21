@@ -167,6 +167,18 @@ function targetText(cfg) {
 }
 
 /* ─────────────── SCORE ENGINE ─────────────── */
+// Robust boolean coercion. Sheets / xlsx round-trips often turn JS booleans
+// into strings like "true"/"FALSE"/"0". Plain `!!v` then reads "false" as
+// truthy, which made completed toggles appear met after a refresh. Always go
+// through this helper before scoring or persisting a boolean.
+const coerceBool = (v) => {
+  if (v === undefined || v === null || v === "") return false;
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v !== 0;
+  const s = String(v).trim().toLowerCase();
+  if (s === "false" || s === "0" || s === "no" || s === "n" || s === "off") return false;
+  return true;
+};
 function calcScore(entry, schema) {
   const criteria = {};
   let metW = 0, totalW = 0;
@@ -183,7 +195,8 @@ function calcScore(entry, schema) {
     const v = entry[c.id];
     let pct = 0; // 0..1 partial credit
     if (cfg.type === "toggle") {
-      pct = (cfg.inverted ? !v : !!v) ? 1 : 0;
+      const b = coerceBool(v);
+      pct = (cfg.inverted ? !b : b) ? 1 : 0;
     } else if (cfg.type === "time") {
       if (v) {
         const [h, m] = String(v).split(":").map(Number);
@@ -267,18 +280,44 @@ const normalizeTime = (v) => {
   return "";
 };
 
-// Walk every entry and coerce each schema-declared `time` field into HH:MM.
-// Cheap (runs once on load + on each setForm-from-entry).
+// Walk every entry and coerce each schema-declared `time` field into HH:MM,
+// and every `toggle` field into a real boolean. Sheets/xlsx round-trips often
+// store booleans as the strings "true"/"false" — `!!"false"` is truthy, so we
+// must normalise before anything renders or scores.
 const normalizeEntry = (entry, schema) => {
   if (!entry) return entry;
   let changed = false;
   const out = { ...entry };
   for (const c of schema) {
-    if (c.type !== "time") continue;
-    const cur = out[c.id];
-    if (cur === undefined || cur === null || cur === "") continue;
-    const fixed = normalizeTime(cur);
-    if (fixed !== cur) { out[c.id] = fixed; changed = true; }
+    if (c.type === "time") {
+      const cur = out[c.id];
+      if (cur === undefined || cur === null || cur === "") continue;
+      const fixed = normalizeTime(cur);
+      if (fixed !== cur) { out[c.id] = fixed; changed = true; }
+    } else if (c.type === "toggle") {
+      const cur = out[c.id];
+      if (cur === undefined || cur === null || cur === "") continue;
+      const fixed = coerceBool(cur);
+      if (fixed !== cur) { out[c.id] = fixed; changed = true; }
+    }
+  }
+  // `isHoliday` is also a boolean that round-trips through Sheets cells.
+  if (out.isHoliday !== undefined && out.isHoliday !== null && typeof out.isHoliday !== "boolean") {
+    const fixed = coerceBool(out.isHoliday);
+    if (fixed !== out.isHoliday) { out.isHoliday = fixed; changed = true; }
+  }
+  // `criteria` may have been stored as JSON-stringified booleans too.
+  if (out.criteria && typeof out.criteria === "object") {
+    let critChanged = false;
+    const fixedCrit = {};
+    for (const k of Object.keys(out.criteria)) {
+      const cv = out.criteria[k];
+      if (cv === null) { fixedCrit[k] = null; continue; }
+      const nb = coerceBool(cv);
+      if (nb !== cv) critChanged = true;
+      fixedCrit[k] = nb;
+    }
+    if (critChanged) { out.criteria = fixedCrit; changed = true; }
   }
   return changed ? out : entry;
 };
@@ -1507,11 +1546,51 @@ function FieldEditor({ field, allFields, onChange, onDelete, onMove }) {
 
           {/* Weight + skipHoliday + trackingSince */}
           <div style={{ display:"flex", gap:14, flexWrap:"wrap", alignItems:"center" }}>
-            <div style={{ flex:"1 1 140px" }}>
-              <Label>Weight (relative)</Label>
-              <input type="number" min="0.1" step="0.5" value={field.weight ?? 1}
-                onChange={e => update("weight", Number(e.target.value))}
-                style={inputSt}/>
+            <div style={{ flex:"1 1 260px" }}>
+              {(() => {
+                const enabledFields = allFields.filter(f => f.enabled);
+                const totalW = enabledFields.reduce((s, f) => s + (Number(f.weight) || 1), 0);
+                const myW = Number(field.weight) || 1;
+                const pct = totalW > 0 ? (myW / totalW) * 100 : 0;
+                const setW = (n) => update("weight", Math.max(0.1, Math.round(n * 10) / 10));
+                return (
+                  <>
+                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:6 }}>
+                      <Label>Weight (relative importance)</Label>
+                      <span style={{ fontSize:11, color:C.muted, fontWeight:700 }}>
+                        ×{myW} · {pct.toFixed(1)}% of score
+                      </span>
+                    </div>
+                    <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                      <input type="range" min="0.5" max="5" step="0.5" value={myW}
+                        onChange={e => setW(Number(e.target.value))}
+                        style={{ flex:1, accentColor:C.purple }}/>
+                      <input type="number" min="0.1" step="0.5" value={myW}
+                        onChange={e => setW(Number(e.target.value) || 1)}
+                        style={{ ...inputSt, width:80, padding:"6px 8px" }}/>
+                    </div>
+                    <div style={{ display:"flex", gap:4, marginTop:6, flexWrap:"wrap" }}>
+                      {[
+                        { v:0.5, lbl:"Low" },
+                        { v:1,   lbl:"Normal" },
+                        { v:2,   lbl:"High" },
+                        { v:3,   lbl:"Critical" },
+                      ].map(p => (
+                        <button key={p.v} onClick={() => setW(p.v)}
+                          style={{
+                            padding:"3px 8px", borderRadius:6, fontSize:10, fontWeight:700,
+                            cursor:"pointer",
+                            background: myW === p.v ? C.purple : "transparent",
+                            color: myW === p.v ? "#fff" : C.muted,
+                            border:`1px solid ${myW === p.v ? C.purple : C.border2}`,
+                          }}>
+                          ×{p.v} {p.lbl}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                );
+              })()}
             </div>
             <div style={{ flex:"1 1 160px" }}>
               <Label>Tracking Since (excludes earlier days from score)</Label>
@@ -1656,27 +1735,28 @@ const KNOWN_FIELDS = [
   { value:"movieMinutes", label:"movieMinutes" },
 ];
 
-function coerceValue(field, raw) {
+function coerceValue(field, raw, schemaField) {
   if (raw === null || raw === undefined || raw === "") return undefined;
+  if (field === "date") {
+    if (typeof raw === "number") return excelSerialToDate(raw);
+    if (raw instanceof Date) return raw.toISOString().split("T")[0];
+    const d = new Date(raw);
+    return isNaN(d) ? String(raw) : d.toISOString().split("T")[0];
+  }
+  if (field === "isHoliday") return coerceBool(raw);
+  // Prefer schema-declared type so user-added custom fields round-trip too.
+  const type = schemaField?.type;
+  if (type === "time" || field === "wake") return fractionToTime(raw);
+  if (type === "toggle") return coerceBool(raw);
+  if (type === "number" || type === "stepper") {
+    const n = Number(raw);
+    return isNaN(n) ? undefined : n;
+  }
+  // Legacy/no-schema fallback for known built-in ids.
   switch (field) {
-    case "date": {
-      if (typeof raw === "number") return excelSerialToDate(raw);
-      // already a string like 2026-04-28 or a Date
-      if (raw instanceof Date) return raw.toISOString().split("T")[0];
-      const d = new Date(raw);
-      return isNaN(d) ? String(raw) : d.toISOString().split("T")[0];
-    }
-    case "wake": {
-      // Now handles numbers, Date objects and strings via fractionToTime.
-      return fractionToTime(raw);
-    }
-    case "isHoliday": case "workout": case "meditation":
-    case "junkFood": case "reading": case "cleaning": {
-      if (typeof raw === "boolean") return raw;
-      if (typeof raw === "number") return raw !== 0;
-      const s = String(raw).trim().toLowerCase();
-      return s === "1" || s === "true" || s === "yes" || s === "y";
-    }
+    case "workout": case "meditation": case "junkFood":
+    case "reading": case "cleaning":
+      return coerceBool(raw);
     default: {
       const n = Number(raw);
       return isNaN(n) ? raw : n;
@@ -1721,7 +1801,8 @@ function ImportPanel({ schema, entries, onImport }) {
       headers.forEach((_, i) => {
         const f = map[i];
         if (!f || f === "_skip") return;
-        const v = coerceValue(f, r[i]);
+        const sf = schema.find(s => s.id === f);
+        const v = coerceValue(f, r[i], sf);
         if (v !== undefined) obj[f] = v;
       });
       return obj;

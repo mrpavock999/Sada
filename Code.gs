@@ -44,7 +44,7 @@ const SHEET_LEGACY  = "Data";
 const SCHEMA_COLS = [
   "id","icon","label","type","op","threshold","holidayThreshold",
   "weight","enabled","unit","max","step","inverted","skipHoliday",
-  "scoreMode","message","targetLabel","rules"
+  "scoreMode","message","targetLabel","trackingSince","rules"
 ];
 // Entries columns that are NOT field IDs.
 const ENTRY_META_COLS = ["date","isHoliday","score","met","total","criteria"];
@@ -144,6 +144,11 @@ function readEntries_() {
   // would otherwise emit Date.toJSON() = UTC ISO, which is offset and, for
   // pre-1900 sentinel dates, also bitten by Local Mean Time).
   const tz = Session.getScriptTimeZone();
+  // Pre-resolve toggle-typed field ids so old data with string "true"/"false"
+  // values is coerced back to real booleans on read.
+  const schemaForRead = readSchema_() || [];
+  const toggleIds = {};
+  schemaForRead.forEach(f => { if (f && f.type === "toggle") toggleIds[f.id] = true; });
   // 1. Prefer Entries sheet
   const s = ss_().getSheetByName(SHEET_ENTRIES);
   if (s) {
@@ -160,6 +165,7 @@ function readEntries_() {
           if (v === "" || v === null) return;
           if (h === "criteria") { obj[h] = safeJson_(v, {}); return; }
           if (h === "isHoliday") { obj[h] = toBool_(v); return; }
+          if (toggleIds[h]) { obj[h] = toBool_(v); return; }
           if (h === "score" || h === "met" || h === "total") { obj[h] = Number(v); return; }
           if (h === "date") {
             obj[h] = (v instanceof Date)
@@ -194,26 +200,35 @@ function readEntries_() {
 function writeEntries_(arr) {
   if (!Array.isArray(arr)) throw new Error("entries must be an array");
   const cols = entryColumns_();
+  const schema = readSchema_() || [];
+  const typeById = {};
+  schema.forEach(f => { if (f && f.id) typeById[f.id] = f.type; });
   const sh = sheet_(SHEET_ENTRIES, cols);
   sh.clear();
   sh.appendRow(cols);
-  // Force every data column to plain-text format BEFORE writing values, so
-  // Sheets doesn't auto-convert "06:30" to a time fraction or "2026-04-29"
-  // to a Date object on round-trip. Only `score`/`met`/`total` should be
-  // numeric, and `isHoliday` boolean — those still serialise fine as text.
+  // Force plain-text format only on columns that hold human-readable
+  // strings — `date` (YYYY-MM-DD) and any `time`-typed field (HH:mm).
+  // Boolean columns must stay UNFORMATTED so Sheets stores them as native
+  // booleans (TRUE/FALSE) instead of coercing them to lowercase strings
+  // "true"/"false" — which, on read-back, both evaluate truthy.
   const dataRows = Math.max(arr.length, 1);
-  sh.getRange(2, 1, dataRows, cols.length).setNumberFormat("@");
+  cols.forEach((c, idx) => {
+    const isString = c === "date" || typeById[c] === "time";
+    if (isString) sh.getRange(2, idx + 1, dataRows, 1).setNumberFormat("@");
+  });
   // Stable sort by date asc for human readability.
   const sorted = arr.slice().sort((a,b) => String(a.date||"").localeCompare(String(b.date||"")));
   const rows = sorted.map(e => cols.map(c => {
     const v = e[c];
     if (v === undefined || v === null) return "";
     if (c === "criteria") return JSON.stringify(v);
+    if (c === "isHoliday" || typeById[c] === "toggle") return toBool_(v);
     if (typeof v === "boolean") return v;
     return v;
   }));
   if (rows.length) sh.getRange(2, 1, rows.length, cols.length).setValues(rows);
 }
+function typeId(map, c) { return map[c] || null; }
 
 /* ─────────────── Meta (theme & misc) ─────────────── */
 function readMeta_(key) {
