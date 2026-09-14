@@ -1958,6 +1958,20 @@ function downloadCsv(filename, csv) {
   URL.revokeObjectURL(url);
 }
 
+// SheetJS's own codepage sniffing for BOM-less CSV bytes is unreliable and
+// mangles multi-byte characters (emoji icons import as garbled glyphs). CSV
+// files are read as UTF-8 text ourselves instead; binary .xlsx/.xls keep the
+// arrayBuffer path since their internal XML already declares UTF-8.
+async function readWorkbookFile(file) {
+  const XLSX = await import("xlsx");
+  if (/\.csv$/i.test(file.name)) {
+    const text = await file.text();
+    return { XLSX, workbook: XLSX.read(text, { type:"string" }) };
+  }
+  const buf = await file.arrayBuffer();
+  return { XLSX, workbook: XLSX.read(buf, { type:"array", cellDates:false }) };
+}
+
 function ImportPanel({ schema, entries, onImport }) {
   const [rows, setRows] = useState(null);    // [{__row, ...rawCells}]
   const [headers, setHeaders] = useState([]);
@@ -1971,10 +1985,8 @@ function ImportPanel({ schema, entries, onImport }) {
     if (!file) return;
     setBusy(true); setErr(null); setFilename(file.name);
     try {
-      const XLSX = await import("xlsx");
-      const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type:"array", cellDates:false });
-      const ws = wb.Sheets[wb.SheetNames[0]];
+      const { XLSX, workbook } = await readWorkbookFile(file);
+      const ws = workbook.Sheets[workbook.SheetNames[0]];
       const aoa = XLSX.utils.sheet_to_json(ws, { header:1, defval:null, blankrows:false });
       if (!aoa.length) throw new Error("Sheet is empty");
       const hdr = aoa[0].map(h => h == null ? "" : String(h));
@@ -2366,10 +2378,8 @@ function FoodImportPanel({ items, onImport }) {
     if (!file) return;
     setBusy(true); setErr(null); setFilename(file.name);
     try {
-      const XLSX = await import("xlsx");
-      const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type:"array", cellDates:false });
-      const ws = wb.Sheets[wb.SheetNames[0]];
+      const { XLSX, workbook } = await readWorkbookFile(file);
+      const ws = workbook.Sheets[workbook.SheetNames[0]];
       const aoa = XLSX.utils.sheet_to_json(ws, { header:1, defval:null, blankrows:false });
       if (!aoa.length) throw new Error("File is empty");
       const hdr = aoa[0].map(h => h == null ? "" : String(h));
@@ -2554,6 +2564,53 @@ function FoodSettingsCard({ schema, settings, onChange }) {
   );
 }
 
+// Searchable food item combobox — replaces plain <select> pickers so long
+// item lists stay usable. Selecting a result adds it immediately.
+function FoodItemPicker({ items, onPick, placeholder = "🔍 Search food items to add…" }) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const list = q ? items.filter(i => i.name.toLowerCase().includes(q)) : items;
+    return list.slice(0, 30);
+  }, [items, query]);
+
+  return (
+    <div style={{ position:"relative", flex:"1 1 220px" }}>
+      <input value={query} placeholder={placeholder}
+        onChange={e => { setQuery(e.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        style={inputSt}/>
+      {open && (
+        <div style={{
+          position:"absolute", top:"calc(100% + 4px)", left:0, right:0, zIndex:20,
+          maxHeight:220, overflowY:"auto", background:C.card2, border:`1px solid ${C.border2}`,
+          borderRadius:10, boxShadow:"0 12px 32px rgba(0,0,0,.4)",
+        }}>
+          {filtered.length ? filtered.map(i => (
+            <button key={i.id} type="button"
+              onMouseDown={e => { e.preventDefault(); onPick(i); setQuery(""); setOpen(false); }}
+              onMouseEnter={e => { e.currentTarget.style.background = C.card3; }}
+              onMouseLeave={e => { e.currentTarget.style.background = "transparent"; }}
+              style={{
+                display:"flex", alignItems:"center", gap:8, width:"100%", padding:"8px 10px",
+                border:"none", background:"transparent", color:C.text, cursor:"pointer",
+                fontSize:13, textAlign:"left", fontFamily:"inherit",
+              }}>
+              <span style={{ fontSize:16, flexShrink:0 }}>{i.icon}</span>
+              <span style={{ flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{i.name}</span>
+              <span style={{ fontSize:10, color:C.muted, flexShrink:0 }}>{i.servingQty}{i.qtyUnit}</span>
+            </button>
+          )) : (
+            <div style={{ padding:"10px 12px", color:C.muted, fontSize:12 }}>No matches.</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MealItemRow({ entry, item, onQtyChange, onRemove }) {
   const n = item ? itemNutrients(item, entry.qty) : null;
   return (
@@ -2586,7 +2643,6 @@ function MealItemRow({ entry, item, onQtyChange, onRemove }) {
 function MealTemplateEditor({ template, foodItems, onChange, onDelete, onDuplicate }) {
   const itemsById = useMemo(() => Object.fromEntries(foodItems.map(i => [i.id, i])), [foodItems]);
   const enabledItems = foodItems.filter(i => i.enabled !== false);
-  const [addSel, setAddSel] = useState("");
   const update = (k, v) => onChange({ ...template, [k]: v });
   const setEntry = (i, qty) => {
     const items = [...template.items];
@@ -2594,12 +2650,7 @@ function MealTemplateEditor({ template, foodItems, onChange, onDelete, onDuplica
     onChange({ ...template, items });
   };
   const removeEntry = (i) => onChange({ ...template, items: template.items.filter((_, j) => j !== i) });
-  const addEntry = () => {
-    if (!addSel) return;
-    const item = itemsById[addSel];
-    onChange({ ...template, items:[...template.items, { itemId: addSel, qty: item?.servingQty || 1 }] });
-    setAddSel("");
-  };
+  const addItem = (item) => onChange({ ...template, items:[...template.items, { itemId: item.id, qty: item.servingQty || 1 }] });
   const totals = templateTotals(template, itemsById);
 
   return (
@@ -2650,15 +2701,7 @@ function MealTemplateEditor({ template, foodItems, onChange, onDelete, onDuplica
       </div>
 
       <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
-        <select value={addSel} onChange={e => setAddSel(e.target.value)} style={{ ...inputSt, flex:"1 1 200px" }}>
-          <option value="">— Choose a food item to add —</option>
-          {enabledItems.map(i => <option key={i.id} value={i.id}>{i.icon} {i.name}</option>)}
-        </select>
-        <button onClick={addEntry} disabled={!addSel} className="ht-chip" style={{
-          padding:"8px 14px", borderRadius:8, border:`1px solid ${C.border2}`,
-          background:C.card3, color: addSel ? C.cyan : C.muted, fontWeight:700, fontSize:12,
-          cursor: addSel ? "pointer" : "not-allowed", fontFamily:"inherit",
-        }}>＋ Add Item</button>
+        <FoodItemPicker items={enabledItems} onPick={addItem}/>
       </div>
 
       <div style={{ display:"flex", gap:10, marginTop:2 }}>
@@ -2744,19 +2787,13 @@ function MealTemplatesPanel({ foodItems, templates, onChange }) {
 function MealBlockEditor({ block, foodItems, onChange, onDelete }) {
   const itemsById = useMemo(() => Object.fromEntries(foodItems.map(i => [i.id, i])), [foodItems]);
   const enabledItems = foodItems.filter(i => i.enabled !== false);
-  const [addSel, setAddSel] = useState("");
   const meal = MEAL_TYPES.find(m => m.k === block.mealType) || MEAL_TYPES[0];
   const setEntry = (i, qty) => {
     const items = [...block.items]; items[i] = { ...items[i], qty };
     onChange({ ...block, items });
   };
   const removeEntry = (i) => onChange({ ...block, items: block.items.filter((_, j) => j !== i) });
-  const addEntry = () => {
-    if (!addSel) return;
-    const item = itemsById[addSel];
-    onChange({ ...block, items:[...block.items, { itemId: addSel, qty: item?.servingQty || 1 }] });
-    setAddSel("");
-  };
+  const addItem = (item) => onChange({ ...block, items:[...block.items, { itemId: item.id, qty: item.servingQty || 1 }] });
   const totals = mealBlockTotals(block, itemsById);
 
   return (
@@ -2807,15 +2844,7 @@ function MealBlockEditor({ block, foodItems, onChange, onDelete }) {
       </div>
 
       <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
-        <select value={addSel} onChange={e => setAddSel(e.target.value)} style={{ ...inputSt, flex:"1 1 200px" }}>
-          <option value="">— Choose a food item to add —</option>
-          {enabledItems.map(i => <option key={i.id} value={i.id}>{i.icon} {i.name}</option>)}
-        </select>
-        <button onClick={addEntry} disabled={!addSel} className="ht-chip" style={{
-          padding:"8px 14px", borderRadius:8, border:`1px solid ${C.border2}`,
-          background:C.card3, color: addSel ? C.cyan : C.muted, fontWeight:700, fontSize:12,
-          cursor: addSel ? "pointer" : "not-allowed", fontFamily:"inherit",
-        }}>＋ Add Item</button>
+        <FoodItemPicker items={enabledItems} onPick={addItem}/>
       </div>
     </Card>
   );
