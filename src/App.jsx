@@ -35,6 +35,10 @@ async function dbFetchAll() {
     entries: Array.isArray(json.entries) ? json.entries : [],
     schema:  Array.isArray(json.schema)  ? json.schema  : null,
     theme:   (json.theme && typeof json.theme === "object") ? json.theme : null,
+    // Food tracking is fully additive — defaults to empty so old backends
+    // (not yet redeployed) or old data never break the rest of the app.
+    foodItems:    Array.isArray(json.foodItems) ? json.foodItems : [],
+    foodSettings: (json.foodSettings && typeof json.foodSettings === "object") ? json.foodSettings : null,
   };
 }
 
@@ -102,6 +106,35 @@ const DEFAULT_SCHEMA = [
   { id:"cleaning",    icon:"🧹", label:"Cleaning",        type:"toggle",  weight:1, enabled:true },
   { id:"movieMinutes",icon:"🎬", label:"Screen Limit",    type:"number",  op:"lte", threshold:90,   holidayThreshold:400, unit:"min", weight:1, enabled:true, targetLabel:"Limit" },
 ];
+
+/* ─────────────── FOOD TRACKING (additive — never touches DEFAULT_SCHEMA/entries) ───────────────
+ * FoodItem: { id, icon, name, basis: "fixed"|"per100", qtyUnit, servingQty,
+ *             calories, protein, carbs, fat, fibre, enabled, notes }
+ *   basis "fixed"   → the macros are the totals for exactly `servingQty` `qtyUnit`
+ *                      (e.g. "1 whole-egg omelette" = 644 kcal, matches AI-agent style logs).
+ *   basis "per100"  → macros are per 100 `qtyUnit`, scaled by however much you log.
+ * FoodSettings: { targets:{calories,protein,carbs,fat,fibre},
+ *                 links:{calories,protein,carbs,fat,fibre} } — each `links.*`
+ *   is an existing habit schema field id (or null). Reserved for the daily
+ *   food log phase: once built, a day's nutrient totals will be able to
+ *   auto-fill the linked habit field so it feeds your existing score engine.
+ */
+const FOOD_NUTRIENTS = [
+  { k:"calories", label:"Calories", unit:"kcal", icon:"🔥" },
+  { k:"protein",  label:"Protein",  unit:"g",    icon:"🍗" },
+  { k:"carbs",    label:"Carbs",    unit:"g",    icon:"🍚" },
+  { k:"fat",      label:"Fat",      unit:"g",    icon:"🥑" },
+  { k:"fibre",    label:"Fibre",    unit:"g",    icon:"🌿" },
+];
+const DEFAULT_FOOD_SETTINGS = {
+  targets: { calories:undefined, protein:undefined, carbs:undefined, fat:undefined, fibre:undefined },
+  links:   { calories:null, protein:null, carbs:null, fat:null, fibre:null },
+};
+const newFoodItem = () => ({
+  id:`food_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
+  icon:"🍽️", name:"New Item", basis:"fixed", qtyUnit:"g", servingQty:100,
+  calories:0, protein:0, carbs:0, fat:0, fibre:0, enabled:true,
+});
 
 /* ─────────────── VALIDATION RULES ───────────────
  * Each field has optional `rules: [Rule]`. A Rule looks at OTHER fields in the
@@ -1764,6 +1797,76 @@ function coerceValue(field, raw, schemaField) {
   }
 }
 
+/* ─────────────── FOOD CSV IMPORT/EXPORT HELPERS ─────────────── */
+const FOOD_COLUMN_HINTS = {
+  name:       [/^(item|name|food)$/i],
+  icon:       [/^icon|emoji$/i],
+  basis:      [/^basis$/i],
+  qtyUnit:    [/unit/i],
+  servingQty: [/^qty$|serving\s*(qty|size)/i],
+  calories:   [/cal(ories)?/i],
+  protein:    [/protein/i],
+  carbs:      [/carb/i],
+  fat:        [/^fat$/i],
+  fibre:      [/fib(re|er)/i],
+};
+function autoMapFood(headers) {
+  const map = {};
+  headers.forEach((h, i) => {
+    const txt = String(h || "").trim();
+    if (!txt) { map[i] = "_skip"; return; }
+    let matched = "_skip";
+    for (const [field, patterns] of Object.entries(FOOD_COLUMN_HINTS)) {
+      if (patterns.some(p => p.test(txt))) { matched = field; break; }
+    }
+    map[i] = matched;
+  });
+  return map;
+}
+const FOOD_KNOWN_FIELDS = [
+  { value:"_skip", label:"— Skip —" },
+  { value:"name", label:"name" },
+  { value:"icon", label:"icon" },
+  { value:"basis", label:"basis (fixed/per100)" },
+  { value:"qtyUnit", label:"qtyUnit" },
+  { value:"servingQty", label:"servingQty" },
+  { value:"calories", label:"calories" },
+  { value:"protein", label:"protein" },
+  { value:"carbs", label:"carbs" },
+  { value:"fat", label:"fat" },
+  { value:"fibre", label:"fibre" },
+];
+function coerceFoodValue(field, raw) {
+  if (raw === null || raw === undefined || raw === "") return undefined;
+  if (field === "name" || field === "icon") return String(raw).trim();
+  if (field === "qtyUnit") return String(raw).trim() || "g";
+  if (field === "basis") {
+    const s = String(raw).trim().toLowerCase();
+    return s.startsWith("per") ? "per100" : "fixed";
+  }
+  const n = Number(raw);
+  return isNaN(n) ? undefined : n;
+}
+// Client-side CSV export — no backend round-trip needed, keeps this purely local/no-AI.
+function foodItemsToCsv(items) {
+  const cols = ["name","icon","basis","qtyUnit","servingQty","calories","protein","carbs","fat","fibre","enabled"];
+  const esc = (v) => {
+    const s = v === undefined || v === null ? "" : String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g,'""')}"` : s;
+  };
+  const lines = [cols.join(",")];
+  items.forEach(it => lines.push(cols.map(c => esc(it[c])).join(",")));
+  return lines.join("\n");
+}
+function downloadCsv(filename, csv) {
+  const blob = new Blob([csv], { type:"text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
 function ImportPanel({ schema, entries, onImport }) {
   const [rows, setRows] = useState(null);    // [{__row, ...rawCells}]
   const [headers, setHeaders] = useState([]);
@@ -2008,6 +2111,345 @@ function Engine({ schema, setSchema, entries, onImport }) {
           />
         ))}
       </div>
+    </div>
+  );
+}
+
+/* ─────────────── FOOD TRACKING ───────────────
+ * Fully additive tab. No-AI, no-internet: everything below runs on data you
+ * enter or CSV-import yourself. Storage rides the same Meta-key mechanism as
+ * `theme` (see dbFetchAll/dbWrite) so it costs zero changes to Schema/Entries
+ * and is safe against old clients/backends — unrecognised keys are ignored.
+ */
+function FoodItemCard({ item, onChange, onDelete, onDuplicate }) {
+  const update = (k, v) => onChange({ ...item, [k]: v });
+  return (
+    <Card>
+      <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+        <input value={item.icon || ""} maxLength={4}
+          onChange={e => update("icon", e.target.value)}
+          style={{ ...inputSt, width:52, textAlign:"center", fontSize:20, padding:"6px 4px" }}/>
+        <input value={item.name || ""} placeholder="Item name"
+          onChange={e => update("name", e.target.value)}
+          style={{ ...inputSt, flex:1, fontWeight:700 }}/>
+        <Toggle value={item.enabled !== false} onChange={v => update("enabled", v)}/>
+      </div>
+
+      <div>
+        <Label>Basis</Label>
+        <Segmented value={item.basis === "per100" ? "per100" : "fixed"} onChange={v => update("basis", v)} options={[
+          { value:"fixed",  label:"Fixed serving" },
+          { value:"per100", label:"Per 100 units" },
+        ]}/>
+        <div style={{ fontSize:10, color:C.muted, marginTop:4 }}>
+          {item.basis === "per100"
+            ? "Macros below are per 100 of the unit — scaled automatically by whatever qty you log."
+            : "Macros below are the total for exactly the serving qty/unit shown (matches how your AI-agent logs read)."}
+        </div>
+      </div>
+
+      <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+        <div style={{ flex:"1 1 100px" }}>
+          <Label>{item.basis === "per100" ? "Per (amount)" : "Serving Qty"}</Label>
+          <input type="number" value={item.servingQty ?? ""} placeholder={item.basis === "per100" ? "100" : "e.g. 64"}
+            onChange={e => update("servingQty", e.target.value === "" ? undefined : Number(e.target.value))}
+            style={inputSt}/>
+        </div>
+        <div style={{ flex:"1 1 100px" }}>
+          <Label>Unit</Label>
+          <input value={item.qtyUnit || ""} placeholder="g / ml / piece"
+            onChange={e => update("qtyUnit", e.target.value)}
+            style={inputSt}/>
+        </div>
+      </div>
+
+      <Div/>
+      <Label accent={C.cyan}>Nutrients</Label>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(90px,1fr))", gap:10 }}>
+        {FOOD_NUTRIENTS.map(n => (
+          <div key={n.k}>
+            <Label>{n.icon} {n.label} ({n.unit})</Label>
+            <input type="number" step="0.1" value={item[n.k] ?? ""} placeholder="0"
+              onChange={e => update(n.k, e.target.value === "" ? undefined : Number(e.target.value))}
+              style={inputSt}/>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display:"flex", gap:10, marginTop:2 }}>
+        <button onClick={onDuplicate} className="ht-chip" style={{
+          padding:"7px 14px", borderRadius:8, border:`1px solid ${C.border2}`,
+          background:C.card3, color:C.muted, fontWeight:700, fontSize:12, cursor:"pointer", fontFamily:"inherit",
+        }}>⧉ Duplicate</button>
+        <button onClick={onDelete} className="ht-chip" style={{
+          padding:"7px 14px", borderRadius:8, border:`1px solid ${C.red}55`,
+          background:`${C.red}15`, color:C.red, fontWeight:700, fontSize:12, cursor:"pointer", fontFamily:"inherit",
+          marginLeft:"auto",
+        }}>🗑 Delete</button>
+      </div>
+    </Card>
+  );
+}
+
+function FoodImportPanel({ items, onImport }) {
+  const [rows, setRows] = useState(null);
+  const [headers, setHeaders] = useState([]);
+  const [map, setMap] = useState({});
+  const [mode, setMode] = useState("add"); // add | replace-all | merge-by-name
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [filename, setFilename] = useState("");
+
+  const onFile = async (file) => {
+    if (!file) return;
+    setBusy(true); setErr(null); setFilename(file.name);
+    try {
+      const XLSX = await import("xlsx");
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type:"array", cellDates:false });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const aoa = XLSX.utils.sheet_to_json(ws, { header:1, defval:null, blankrows:false });
+      if (!aoa.length) throw new Error("File is empty");
+      const hdr = aoa[0].map(h => h == null ? "" : String(h));
+      const data = aoa.slice(1).filter(r => r.some(c => c !== null && c !== ""));
+      setHeaders(hdr);
+      setRows(data);
+      setMap(autoMapFood(hdr));
+    } catch (e) {
+      setErr(e.message || String(e));
+      setRows(null);
+    } finally { setBusy(false); }
+  };
+
+  const preview = useMemo(() => {
+    if (!rows) return [];
+    return rows.map(r => {
+      const obj = newFoodItem();
+      delete obj.name;
+      headers.forEach((_, i) => {
+        const f = map[i];
+        if (!f || f === "_skip") return;
+        const v = coerceFoodValue(f, r[i]);
+        if (v !== undefined) obj[f] = v;
+      });
+      return obj;
+    }).filter(o => o.name);
+  }, [rows, headers, map]);
+
+  const doImport = async () => {
+    if (!preview.length) return;
+    let merged;
+    if (mode === "replace-all") merged = preview;
+    else if (mode === "merge-by-name") {
+      const byName = new Map(items.map(it => [it.name.trim().toLowerCase(), it]));
+      preview.forEach(p => {
+        const key = p.name.trim().toLowerCase();
+        const existing = byName.get(key);
+        byName.set(key, existing ? { ...existing, ...p, id: existing.id } : p);
+      });
+      merged = [...byName.values()];
+    } else { // add
+      merged = [...items, ...preview];
+    }
+    setBusy(true); setErr(null);
+    try {
+      await onImport(merged);
+      setRows(null); setHeaders([]); setMap({}); setFilename("");
+    } catch (e) { setErr(e.message || String(e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <Card>
+      <Label accent={C.cyan}>📥 Import Food Items (CSV / Excel)</Label>
+      <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
+        Columns auto-map to name / icon / basis / qtyUnit / servingQty / calories / protein / carbs / fat / fibre. Adjust below, then import. Fully offline — nothing leaves your browser except the final sync to your Sheet.
+      </div>
+
+      <label className="ht-chip" style={{
+        display:"inline-flex", alignItems:"center", gap:8,
+        padding:"10px 16px", borderRadius:10, border:`1.5px dashed ${C.purple}66`,
+        background:`${C.purple}11`, color:C.purple, fontWeight:700, fontSize:13,
+        cursor: busy ? "wait" : "pointer", width:"fit-content",
+      }}>
+        📂 {filename || "Choose CSV / Excel file…"}
+        <input type="file" accept=".xlsx,.xls,.csv" disabled={busy}
+          onChange={e => onFile(e.target.files?.[0])}
+          style={{ display:"none" }}/>
+      </label>
+
+      {err && (
+        <div style={{ padding:12, borderRadius:8, background:`${C.red}15`, border:`1px solid ${C.red}55`, color:C.red, fontSize:13 }}>
+          ⚠️ {err}
+        </div>
+      )}
+
+      {rows && (
+        <>
+          <Div/>
+          <Label>Column Mapping</Label>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr auto 1fr", gap:"8px 12px", alignItems:"center" }}>
+            {headers.map((h, i) => (
+              <div key={i} style={{ display:"contents" }}>
+                <div style={{ fontSize:12, color:C.text, fontWeight:600, padding:"6px 10px", background:C.card3, borderRadius:6, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }} title={h}>
+                  <span style={{ color:C.muted, fontFamily:"monospace", marginRight:6 }}>{String.fromCharCode(65+i)}</span>{h || <em style={{color:C.muted}}>(empty)</em>}
+                </div>
+                <div style={{ color:C.muted, fontSize:14 }}>→</div>
+                <select value={map[i] || "_skip"}
+                  onChange={e => setMap({ ...map, [i]: e.target.value })}
+                  style={{ ...inputSt, padding:"6px 10px", fontSize:12 }}>
+                  {FOOD_KNOWN_FIELDS.map(f => <option key={f.value} value={f.value}>{f.label}</option>)}
+                </select>
+              </div>
+            ))}
+          </div>
+
+          <Div/>
+          <Label>Preview ({preview.length} valid rows)</Label>
+          <div style={{ maxHeight:200, overflow:"auto", border:`1px solid ${C.border}`, borderRadius:8 }}>
+            <table style={{ width:"100%", fontSize:11, borderCollapse:"collapse" }}>
+              <thead style={{ position:"sticky", top:0, background:C.card3 }}>
+                <tr>
+                  {["name","basis","qtyUnit","servingQty","calories","protein","carbs","fat","fibre"].map(k => (
+                    <th key={k} style={{ padding:"6px 8px", textAlign:"left", color:C.muted, fontWeight:700, borderBottom:`1px solid ${C.border}` }}>{k}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {preview.slice(0, 8).map((e, i) => (
+                  <tr key={i} style={{ background: i%2 ? C.card2 : "transparent" }}>
+                    {["name","basis","qtyUnit","servingQty","calories","protein","carbs","fat","fibre"].map(k => (
+                      <td key={k} style={{ padding:"5px 8px", color:C.text, borderBottom:`1px solid ${C.border}`, whiteSpace:"nowrap" }}>{String(e[k] ?? "")}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <Div/>
+          <Label>Import Mode</Label>
+          <Segmented value={mode} onChange={setMode} options={[
+            { value:"add",           label:"Add as new" },
+            { value:"merge-by-name", label:"Merge by name" },
+            { value:"replace-all",   label:"Replace all items" },
+          ]}/>
+          <div style={{ fontSize:11, color:C.muted, marginTop:-6 }}>
+            {mode === "add" && "Every row becomes a brand-new item, even if a similar name exists."}
+            {mode === "merge-by-name" && "Rows matching an existing item name update it; new names are added."}
+            {mode === "replace-all" && "⚠️ Your entire Food Item list is replaced with this file's contents."}
+          </div>
+
+          <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+            <button onClick={doImport} disabled={busy || !preview.length} className="ht-cta" style={{
+              padding:"10px 18px", borderRadius:10, border:"none",
+              background: busy ? C.muted : `linear-gradient(135deg,${C.violet},${C.purple})`,
+              color:C.white, fontWeight:700, fontSize:13,
+              cursor: busy ? "wait" : "pointer", fontFamily:"inherit",
+              boxShadow:`0 4px 12px ${C.purple}55`,
+            }}>{busy ? "Importing…" : `📥 Import ${preview.length} Items`}</button>
+            <button onClick={() => { setRows(null); setHeaders([]); setMap({}); setFilename(""); }} className="ht-chip" style={{
+              padding:"10px 18px", borderRadius:10, border:`1px solid ${C.border2}`,
+              background:C.card3, color:C.muted, fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
+            }}>Cancel</button>
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
+function FoodSettingsCard({ schema, settings, onChange }) {
+  const s = { targets:{...DEFAULT_FOOD_SETTINGS.targets, ...settings?.targets}, links:{...DEFAULT_FOOD_SETTINGS.links, ...settings?.links} };
+  const setTarget = (k, v) => onChange({ ...s, targets:{ ...s.targets, [k]: v === "" ? undefined : Number(v) } });
+  const setLink = (k, v) => onChange({ ...s, links:{ ...s.links, [k]: v || null } });
+  // Only number/stepper habit fields make sense as a numeric nutrient link.
+  const linkable = schema.filter(f => f.type === "number" || f.type === "stepper");
+  return (
+    <Card>
+      <Label accent={C.purple}>🎯 Daily Targets & Habit Linking</Label>
+      <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
+        Set your daily nutrient targets. Optionally link a nutrient to an existing habit field —
+        once meal logging is added, that day's total will be able to auto-fill the linked field
+        so it factors into your score, with no double entry.
+      </div>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))", gap:14 }}>
+        {FOOD_NUTRIENTS.map(n => (
+          <div key={n.k} style={{ display:"flex", flexDirection:"column", gap:6, padding:12, borderRadius:10, background:C.card3, border:`1px solid ${C.border2}` }}>
+            <Label>{n.icon} {n.label} target ({n.unit})</Label>
+            <input type="number" value={s.targets[n.k] ?? ""} placeholder="e.g. 1800"
+              onChange={e => setTarget(n.k, e.target.value)}
+              style={inputSt}/>
+            <Label>Link to habit field</Label>
+            <select value={s.links[n.k] || ""} onChange={e => setLink(n.k, e.target.value)} style={inputSt}>
+              <option value="">— None —</option>
+              {linkable.map(f => <option key={f.id} value={f.id}>{f.icon} {f.label}</option>)}
+            </select>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+function FoodPanel({ schema, foodItems, onChangeItems, foodSettings, onChangeSettings }) {
+  const items = foodItems || [];
+  const update = (i, next) => { const arr = [...items]; arr[i] = next; onChangeItems(arr); };
+  const del = (i) => {
+    if (!confirm(`Delete "${items[i].name}"?`)) return;
+    onChangeItems(items.filter((_, j) => j !== i));
+  };
+  const duplicate = (i) => {
+    const copy = { ...items[i], id:`food_${Date.now()}_${Math.random().toString(36).slice(2,7)}`, name:`${items[i].name} (copy)` };
+    onChangeItems([...items.slice(0, i+1), copy, ...items.slice(i+1)]);
+  };
+  const add = () => onChangeItems([...items, newFoodItem()]);
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+      <Card>
+        <Label accent={C.green}>🍎 Food Tracking</Label>
+        <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
+          Build your own food item database — no AI, no internet required. Add items manually,
+          or bulk-import from a CSV/Excel file you maintain. Nothing here changes your existing
+          habits, entries, or scores; it's a fully separate, additive dataset.
+        </div>
+        <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+          <button onClick={add} className="ht-cta" style={{
+            padding:"8px 16px", borderRadius:10, border:"none",
+            background:`linear-gradient(135deg,${C.violet},${C.purple})`, color:C.white,
+            fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
+            boxShadow:`0 4px 12px ${C.purple}55`,
+          }}>＋ Add Food Item</button>
+          <button onClick={() => downloadCsv("food-items.csv", foodItemsToCsv(items))} disabled={!items.length} className="ht-chip" style={{
+            padding:"8px 16px", borderRadius:10, border:`1px solid ${C.border2}`,
+            background:C.card3, color: items.length ? C.muted : C.border2, fontWeight:700, fontSize:13,
+            cursor: items.length ? "pointer" : "not-allowed", fontFamily:"inherit",
+          }}>⬇ Export CSV</button>
+          <div style={{ marginLeft:"auto", padding:"8px 14px", borderRadius:10, background:`${C.green}15`, border:`1px solid ${C.green}33`, color:C.green, fontSize:12, fontWeight:700 }}>
+            {items.filter(i => i.enabled !== false).length} active · {items.length} total
+          </div>
+        </div>
+      </Card>
+
+      <FoodSettingsCard schema={schema} settings={foodSettings} onChange={onChangeSettings}/>
+      <FoodImportPanel items={items} onImport={onChangeItems}/>
+
+      {!items.length ? (
+        <Card style={{ alignItems:"center", textAlign:"center", padding:32 }}>
+          <div style={{ fontSize:40 }}>🍽️</div>
+          <div style={{ fontSize:14, color:C.muted }}>No food items yet — add one or import a CSV to get started.</div>
+        </Card>
+      ) : (
+        <div className="ht-engine-grid">
+          {items.map((it, i) => (
+            <FoodItemCard key={it.id} item={it}
+              onChange={(next) => update(i, next)}
+              onDelete={() => del(i)}
+              onDuplicate={() => duplicate(i)}/>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -2352,6 +2794,10 @@ export default function App() {
   const [, setThemeVersion] = useState(0);
   // Day-detail modal: { ds: "YYYY-MM-DD" } | null
   const [dayDetail, setDayDetail] = useState(null);
+  // Food tracking (additive) — empty/default until you add items or a CSV.
+  const [foodItems, setFoodItems] = useState([]);
+  const [foodSettings, setFoodSettings] = useState(DEFAULT_FOOD_SETTINGS);
+  const [foodSeen, setFoodSeen] = useState(() => { try { return !!localStorage.getItem("ht_food_seen_v1"); } catch { return false; } });
   // Auth gate: shown when no passcode yet, or after a 401 from the backend.
   const [locked, setLocked] = useState(() => !getAuth());
 
@@ -2370,7 +2816,7 @@ export default function App() {
     (async () => {
       setSync({ state: "syncing", msg: "Loading from Sheet…" });
       try {
-        const { entries: e, schema: s, theme: t } = await dbFetchAll();
+        const { entries: e, schema: s, theme: t, foodItems: fi, foodSettings: fs } = await dbFetchAll();
         const effSchema = (s && s.length) ? s : DEFAULT_SCHEMA;
         // Normalise time fields immediately so <input type="time"> never sees
         // a Date/fraction round-tripped from Sheets.
@@ -2386,6 +2832,9 @@ export default function App() {
           Object.assign(C, merged);
           setThemeVersion(v => v + 1);
         }
+        // Food tracking: purely additive, defaults keep existing data/UI untouched.
+        setFoodItems(Array.isArray(fi) ? fi : []);
+        if (fs) setFoodSettings({ targets:{...DEFAULT_FOOD_SETTINGS.targets, ...fs.targets}, links:{...DEFAULT_FOOD_SETTINGS.links, ...fs.links} });
         setSync({ state: "saved", msg: `Synced · ${e.length} entries`, ts: Date.now() });
       } catch (err) {
         if (err && err.code === 401) {
@@ -2418,6 +2867,33 @@ export default function App() {
     }
   };
   const resetTheme = () => updateTheme(DEFAULT_THEME);
+
+  // Persist food items / settings the same way theme/schema do — independent
+  // of the habit save flow, so a failure here never blocks habit logging.
+  const updateFoodItems = async (next) => {
+    setFoodItems(next);
+    setSync({ state: "syncing", msg: "Saving food items…" });
+    try {
+      await dbWrite("foodItems", next);
+      setSync({ state: "saved", msg: "Food items synced", ts: Date.now() });
+    } catch (err) {
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
+      console.error(err);
+      setSync({ state: "error", msg: err.message || "Food items save failed" });
+    }
+  };
+  const updateFoodSettings = async (next) => {
+    setFoodSettings(next);
+    setSync({ state: "syncing", msg: "Saving food settings…" });
+    try {
+      await dbWrite("foodSettings", next);
+      setSync({ state: "saved", msg: "Food settings synced", ts: Date.now() });
+    } catch (err) {
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
+      console.error(err);
+      setSync({ state: "error", msg: err.message || "Food settings save failed" });
+    }
+  };
 
   // Persist schema to sheet only when user actually edits it (via updateSchema).
   const updateSchema = async (next) => {
@@ -2517,9 +2993,18 @@ export default function App() {
     { k:"dashboard", label:"Dashboard", icon:"📊" },
     { k:"log",       label:"Log",       icon:"✍️" },
     { k:"history",   label:"History",   icon:"🗂️" },
+    { k:"food",      label:"Food",      icon:"🍎", isNew:true },
     { k:"engine",    label:"Engine",    icon:"⚙️" },
     { k:"settings",  label:"Settings",  icon:"🎨" },
   ];
+  // Selecting the Food tab dismisses its "NEW" indicator for good.
+  const selectTab = (k) => {
+    setTab(k);
+    if (k === "food" && !foodSeen) {
+      setFoodSeen(true);
+      try { localStorage.setItem("ht_food_seen_v1", "1"); } catch {}
+    }
+  };
 
   if (locked) {
     return <PasscodeGate onUnlock={(pc) => {
@@ -2555,10 +3040,11 @@ export default function App() {
 
           <nav className="ht-tabs">
             {tabs.map(t => (
-              <button key={t.k} onClick={() => setTab(t.k)}
+              <button key={t.k} onClick={() => selectTab(t.k)}
                 className={`ht-tab ${tab===t.k ? "active" : ""}`}>
                 <span className="ht-tab-icon">{t.icon}</span>
                 <span className="ht-tab-label">{t.label}</span>
+                {t.isNew && !foodSeen && <span className="ht-new-pill">NEW</span>}
               </button>
             ))}
           </nav>
@@ -2583,11 +3069,12 @@ export default function App() {
                   <button
                     key={t.k}
                     role="menuitem"
-                    onClick={() => { setTab(t.k); setMenuOpen(false); }}
+                    onClick={() => { selectTab(t.k); setMenuOpen(false); }}
                     className={`ht-menu-item ${tab===t.k ? "active" : ""}`}
                   >
                     <span className="ht-tab-icon">{t.icon}</span>
                     <span>{t.label}</span>
+                    {t.isNew && !foodSeen && <span className="ht-new-pill">NEW</span>}
                     {tab===t.k && <span className="ht-menu-check">✓</span>}
                   </button>
                 ))}
@@ -2703,6 +3190,12 @@ function GlobalStyles() {
       }
       .ht-tab-icon { font-size: 14px; }
       .ht-tab-label { text-transform: uppercase; }
+      .ht-new-pill {
+        font-size: 9px; font-weight: 800; letter-spacing: .5px;
+        padding: 2px 6px; border-radius: 999px; color: ${C.white};
+        background: linear-gradient(135deg, ${C.pink}, ${C.red});
+        animation: pulse 1.6s ease-in-out infinite;
+      }
 
       /* Mobile menu trigger (hidden on desktop) */
       .ht-menu-trigger {
