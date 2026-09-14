@@ -18,18 +18,28 @@ const getAuth = () => { try { return localStorage.getItem(AUTH_KEY) || ""; } cat
 const setAuth = (v) => { try { v ? localStorage.setItem(AUTH_KEY, v) : localStorage.removeItem(AUTH_KEY); } catch {} };
 class UnauthorizedError extends Error { constructor() { super("unauthorized"); this.code = 401; } }
 
+// Apps Script sometimes serves an HTML "warm up" interstitial for the first
+// request or two right after a fresh deployment, instead of executing the
+// script. It resolves itself within a few seconds, so retry briefly before
+// surfacing an error to the user.
+async function fetchJsonWithRetry(url, options, retries = 2, delayMs = 900) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, options);
+    const text = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0,200)}`);
+    if (text.trim().startsWith("<")) {
+      if (attempt < retries) { await new Promise(r => setTimeout(r, delayMs)); continue; }
+      const m = text.match(/TypeError[^<]*|Error[^<]*/);
+      throw new Error(m ? `Apps Script error: ${m[0]}` : "Backend still deploying — please try again in a few seconds.");
+    }
+    try { return JSON.parse(text); }
+    catch { throw new Error("Sheet returned non-JSON response"); }
+  }
+}
+
 async function dbFetchAll() {
   const url = SHEETS_URL + "?k=" + encodeURIComponent(getAuth());
-  const res = await fetch(url, { method: "GET", redirect: "follow" });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0,200)}`);
-  if (text.trim().startsWith("<")) {
-    const m = text.match(/TypeError[^<]*|Error[^<]*/);
-    throw new Error(`Apps Script error: ${m ? m[0] : "returned HTML, not JSON"}`);
-  }
-  let json;
-  try { json = JSON.parse(text); }
-  catch { throw new Error("Sheet returned non-JSON response"); }
+  const json = await fetchJsonWithRetry(url, { method: "GET", redirect: "follow" });
   if (json && json.error === "unauthorized") throw new UnauthorizedError();
   return {
     entries: Array.isArray(json.entries) ? json.entries : [],
@@ -1152,7 +1162,8 @@ function TargetBadge({ cfg, value }) {
   );
 }
 
-function LogEntry({ form, setForm, live, schema, onDateChange, onSave, saved, onQuickFill, hasYesterday }) {
+function LogEntry({ form, setForm, live, schema, onDateChange, onSave, saved, onQuickFill, hasYesterday,
+  foodItems, mealTemplates, foodEntries, onChangeFoodEntries, foodSettings, onApplyFoodLinks }) {
   const f = (k, v) => setForm(p => ({ ...p, [k]: v }));
   const isFlawless = live.score === 100;
 
@@ -1268,6 +1279,12 @@ function LogEntry({ form, setForm, live, schema, onDateChange, onSave, saved, on
       }}>
         {saved ? "✓ Saved!" : "💾 Save Entry"}
       </button>
+
+      {/* Food tracking for the same day being logged above */}
+      <div style={{ gridColumn:"1 / -1" }}>
+        <DailyFoodLogPanel date={form.date} schema={schema} foodItems={foodItems} mealTemplates={mealTemplates}
+          foodEntries={foodEntries} onChangeEntries={onChangeFoodEntries} foodSettings={foodSettings} onApplyLinks={onApplyFoodLinks}/>
+      </div>
     </div>
   );
 }
@@ -2121,8 +2138,9 @@ function ImportPanel({ schema, entries, onImport }) {
   );
 }
 
-function Engine({ schema, setSchema, entries, onImport }) {
+function Engine({ schema, setSchema, entries, onImport, foodItems, onChangeFoodItems, mealTemplates, onChangeMealTemplates }) {
   const totalW = schema.filter(c=>c.enabled).reduce((s,c)=>s+(Number(c.weight)||1), 0);
+  const [subTab, setSubTab] = useState("habits"); // habits | items | templates
 
   const update = (i, f) => {
     const next = [...schema]; next[i] = f; setSchema(next);
@@ -2147,44 +2165,114 @@ function Engine({ schema, setSchema, entries, onImport }) {
     setSchema(DEFAULT_SCHEMA);
   };
 
+  // Food Item CRUD (shared with the old standalone Food tab, now here).
+  const foodUpdate = (i, next) => { const arr = [...foodItems]; arr[i] = next; onChangeFoodItems(arr); };
+  const foodDel = (i) => {
+    if (!confirm(`Delete "${foodItems[i].name}"?`)) return;
+    onChangeFoodItems(foodItems.filter((_, j) => j !== i));
+  };
+  const foodDuplicate = (i) => {
+    const copy = { ...foodItems[i], id:`food_${Date.now()}_${Math.random().toString(36).slice(2,7)}`, name:`${foodItems[i].name} (copy)` };
+    onChangeFoodItems([...foodItems.slice(0, i+1), copy, ...foodItems.slice(i+1)]);
+  };
+  const foodAdd = () => onChangeFoodItems([...foodItems, newFoodItem()]);
+
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
       <Card>
-        <Label accent={C.purple}>⚙️ Score Engine Editor</Label>
-        <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
-          Add, edit, reorder, and weight habits. Score = <b>met weight</b> ÷ <b>total weight</b> × 100.
-        </div>
-        <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
-          <button onClick={add} className="ht-cta" style={{
-            padding:"8px 16px", borderRadius:10, border:"none",
-            background:`linear-gradient(135deg,${C.violet},${C.purple})`, color:C.white,
-            fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
-            boxShadow:`0 4px 12px ${C.purple}55`,
-          }}>＋ Add Habit</button>
-          <button onClick={reset} className="ht-chip" style={{
-            padding:"8px 16px", borderRadius:10, border:`1px solid ${C.border2}`,
-            background:C.card3, color:C.muted, fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
-          }}>↺ Reset to Defaults</button>
-          <div style={{ marginLeft:"auto", padding:"8px 14px", borderRadius:10, background:`${C.cyan}15`, border:`1px solid ${C.cyan}33`, color:C.cyan, fontSize:12, fontWeight:700 }}>
-            {schema.filter(c=>c.enabled).length} active · total weight {totalW}
-          </div>
-        </div>
+        <Segmented value={subTab} onChange={setSubTab} options={[
+          { value:"habits",    label:"⚙️ Habits" },
+          { value:"items",     label:"🥫 Food Items" },
+          { value:"templates", label:"🍽️ Meal Templates" },
+        ]}/>
       </Card>
 
-      <ImportPanel schema={schema} entries={entries} onImport={onImport}/>
+      {subTab === "items" ? (
+        <>
+          <Card>
+            <Label accent={C.green}>🥫 Food Item Database</Label>
+            <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
+              Build your own food item database — no AI, no internet required. Add items manually,
+              or bulk-import from a CSV/Excel file you maintain.
+            </div>
+            <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+              <button onClick={foodAdd} className="ht-cta" style={{
+                padding:"8px 16px", borderRadius:10, border:"none",
+                background:`linear-gradient(135deg,${C.violet},${C.purple})`, color:C.white,
+                fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
+                boxShadow:`0 4px 12px ${C.purple}55`,
+              }}>＋ Add Food Item</button>
+              <button onClick={() => downloadCsv("food-items.csv", foodItemsToCsv(foodItems))} disabled={!foodItems.length} className="ht-chip" style={{
+                padding:"8px 16px", borderRadius:10, border:`1px solid ${C.border2}`,
+                background:C.card3, color: foodItems.length ? C.muted : C.border2, fontWeight:700, fontSize:13,
+                cursor: foodItems.length ? "pointer" : "not-allowed", fontFamily:"inherit",
+              }}>⬇ Export CSV</button>
+              <div style={{ marginLeft:"auto", padding:"8px 14px", borderRadius:10, background:`${C.green}15`, border:`1px solid ${C.green}33`, color:C.green, fontSize:12, fontWeight:700 }}>
+                {foodItems.filter(i => i.enabled !== false).length} active · {foodItems.length} total
+              </div>
+            </div>
+          </Card>
 
-      <div className="ht-engine-grid">
-        {schema.map((f, i) => (
-          <FieldEditor
-            key={f.id}
-            field={f}
-            allFields={schema}
-            onChange={(nf) => update(i, nf)}
-            onDelete={() => del(i)}
-            onMove={(dir) => move(i, dir)}
-          />
-        ))}
-      </div>
+          <FoodImportPanel items={foodItems} onImport={onChangeFoodItems}/>
+
+          {!foodItems.length ? (
+            <Card style={{ alignItems:"center", textAlign:"center", padding:32 }}>
+              <div style={{ fontSize:40 }}>🍽️</div>
+              <div style={{ fontSize:14, color:C.muted }}>No food items yet — add one or import a CSV to get started.</div>
+            </Card>
+          ) : (
+            <div className="ht-engine-grid">
+              {foodItems.map((it, i) => (
+                <FoodItemCard key={it.id} item={it}
+                  onChange={(next) => foodUpdate(i, next)}
+                  onDelete={() => foodDel(i)}
+                  onDuplicate={() => foodDuplicate(i)}/>
+              ))}
+            </div>
+          )}
+        </>
+      ) : subTab === "templates" ? (
+        <MealTemplatesPanel foodItems={foodItems} templates={mealTemplates} onChange={onChangeMealTemplates}/>
+      ) : (
+        <>
+          <Card>
+            <Label accent={C.purple}>⚙️ Score Engine Editor</Label>
+            <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
+              Add, edit, reorder, and weight habits. Score = <b>met weight</b> ÷ <b>total weight</b> × 100.
+            </div>
+            <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+              <button onClick={add} className="ht-cta" style={{
+                padding:"8px 16px", borderRadius:10, border:"none",
+                background:`linear-gradient(135deg,${C.violet},${C.purple})`, color:C.white,
+                fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
+                boxShadow:`0 4px 12px ${C.purple}55`,
+              }}>＋ Add Habit</button>
+              <button onClick={reset} className="ht-chip" style={{
+                padding:"8px 16px", borderRadius:10, border:`1px solid ${C.border2}`,
+                background:C.card3, color:C.muted, fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
+              }}>↺ Reset to Defaults</button>
+              <div style={{ marginLeft:"auto", padding:"8px 14px", borderRadius:10, background:`${C.cyan}15`, border:`1px solid ${C.cyan}33`, color:C.cyan, fontSize:12, fontWeight:700 }}>
+                {schema.filter(c=>c.enabled).length} active · total weight {totalW}
+              </div>
+            </div>
+          </Card>
+
+          <ImportPanel schema={schema} entries={entries} onImport={onImport}/>
+
+          <div className="ht-engine-grid">
+            {schema.map((f, i) => (
+              <FieldEditor
+                key={f.id}
+                field={f}
+                allFields={schema}
+                onChange={(nf) => update(i, nf)}
+                onDelete={() => del(i)}
+                onMove={(dir) => move(i, dir)}
+              />
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -2444,8 +2532,8 @@ function FoodSettingsCard({ schema, settings, onChange }) {
       <Label accent={C.purple}>🎯 Daily Targets & Habit Linking</Label>
       <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
         Set your daily nutrient targets. Optionally link a nutrient to an existing habit field —
-        once meal logging is added, that day's total will be able to auto-fill the linked field
-        so it factors into your score, with no double entry.
+        from the Log tab's Food Tracking section, hitting "Sync Linked Habit Fields" will write that
+        day's total into the linked field so it factors into your score, with no double entry.
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))", gap:14 }}>
         {FOOD_NUTRIENTS.map(n => (
@@ -2629,7 +2717,7 @@ function MealTemplatesPanel({ foodItems, templates, onChange }) {
           </div>
         </div>
         {!foodItems.length && (
-          <div style={{ fontSize:12, color:C.muted }}>Add at least one Food Item first (see the Items tab) before building a meal template.</div>
+          <div style={{ fontSize:12, color:C.muted }}>Add at least one Food Item first (Engine → 🥫 Food Items) before building a meal template.</div>
         )}
       </Card>
 
@@ -2733,8 +2821,7 @@ function MealBlockEditor({ block, foodItems, onChange, onDelete }) {
   );
 }
 
-function DailyFoodLogPanel({ schema, foodItems, mealTemplates, foodEntries, onChangeEntries, foodSettings, onApplyLinks }) {
-  const [date, setDate] = useState(getToday());
+function DailyFoodLogPanel({ date, schema, foodItems, mealTemplates, foodEntries, onChangeEntries, foodSettings, onApplyLinks }) {
   const [addMealType, setAddMealType] = useState("breakfast");
   const [addTemplateId, setAddTemplateId] = useState("");
   const [status, setStatus] = useState(null);
@@ -2772,30 +2859,13 @@ function DailyFoodLogPanel({ schema, foodItems, mealTemplates, foodEntries, onCh
 
   const sync = () => {
     onApplyLinks(date, totals);
-    setStatus(linkedCount ? `✓ Synced ${linkedCount} linked habit field${linkedCount>1?"s":""} for ${date}` : "No nutrients are linked yet (see Items tab → Daily Targets & Habit Linking).");
+    setStatus(linkedCount ? `✓ Synced ${linkedCount} linked habit field${linkedCount>1?"s":""} for ${date}` : "No nutrients are linked yet (see Settings → Food Targets & Habit Linking).");
   };
 
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
       <Card>
-        <Label accent={C.cyan}>📅 Daily Food Log</Label>
-        <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
-          <button onClick={() => setDate(addDays(date, -1))} className="ht-chip" style={{
-            padding:"8px 12px", borderRadius:8, border:`1px solid ${C.border2}`, background:C.card3,
-            color:C.muted, cursor:"pointer", fontWeight:700,
-          }}>‹</button>
-          <input type="date" value={date} onChange={e => setDate(e.target.value || getToday())} style={{ ...inputSt, width:"auto" }}/>
-          <button onClick={() => setDate(addDays(date, 1))} className="ht-chip" style={{
-            padding:"8px 12px", borderRadius:8, border:`1px solid ${C.border2}`, background:C.card3,
-            color:C.muted, cursor:"pointer", fontWeight:700,
-          }}>›</button>
-          <button onClick={() => setDate(getToday())} className="ht-chip" style={{
-            padding:"8px 12px", borderRadius:8, border:`1px solid ${C.border2}`, background:C.card3,
-            color:C.cyan, cursor:"pointer", fontWeight:700, fontSize:12,
-          }}>Today</button>
-        </div>
-
-        <Div/>
+        <Label accent={C.cyan}>🍎 Food Tracking — {fmtFull(date)}</Label>
         <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
           <select value={addMealType} onChange={e => setAddMealType(e.target.value)} style={{ ...inputSt, width:"auto" }}>
             {MEAL_TYPES.map(m => <option key={m.k} value={m.k}>{m.icon} {m.label}</option>)}
@@ -2878,88 +2948,6 @@ function DailyFoodLogPanel({ schema, foodItems, mealTemplates, foodEntries, onCh
           {status && <span style={{ fontSize:12, color:C.muted }}>{status}</span>}
         </div>
       </Card>
-    </div>
-  );
-}
-
-function FoodPanel({ schema, foodItems, onChangeItems, foodSettings, onChangeSettings, mealTemplates, onChangeTemplates, foodEntries, onChangeEntries, onApplyLinks }) {
-  const items = foodItems || [];
-  const [subTab, setSubTab] = useState("items"); // items | templates
-  const update = (i, next) => { const arr = [...items]; arr[i] = next; onChangeItems(arr); };
-  const del = (i) => {
-    if (!confirm(`Delete "${items[i].name}"?`)) return;
-    onChangeItems(items.filter((_, j) => j !== i));
-  };
-  const duplicate = (i) => {
-    const copy = { ...items[i], id:`food_${Date.now()}_${Math.random().toString(36).slice(2,7)}`, name:`${items[i].name} (copy)` };
-    onChangeItems([...items.slice(0, i+1), copy, ...items.slice(i+1)]);
-  };
-  const add = () => onChangeItems([...items, newFoodItem()]);
-
-  return (
-    <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
-      <Card>
-        <Label accent={C.green}>🍎 Food Tracking</Label>
-        <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
-          Build your own food item database — no AI, no internet required. Add items manually,
-          or bulk-import from a CSV/Excel file you maintain. Nothing here changes your existing
-          habits, entries, or scores; it's a fully separate, additive dataset.
-        </div>
-        <Segmented value={subTab} onChange={setSubTab} options={[
-          { value:"items",     label:"🥫 Items" },
-          { value:"templates", label:"🍽️ Meal Templates" },
-          { value:"log",       label:"📅 Daily Log" },
-        ]}/>
-      </Card>
-
-      <FoodSettingsCard schema={schema} settings={foodSettings} onChange={onChangeSettings}/>
-
-      {subTab === "templates" ? (
-        <MealTemplatesPanel foodItems={items} templates={mealTemplates} onChange={onChangeTemplates}/>
-      ) : subTab === "log" ? (
-        <DailyFoodLogPanel schema={schema} foodItems={items} mealTemplates={mealTemplates || []}
-          foodEntries={foodEntries || []} onChangeEntries={onChangeEntries}
-          foodSettings={foodSettings} onApplyLinks={onApplyLinks}/>
-      ) : (
-        <>
-          <Card>
-            <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
-              <button onClick={add} className="ht-cta" style={{
-                padding:"8px 16px", borderRadius:10, border:"none",
-                background:`linear-gradient(135deg,${C.violet},${C.purple})`, color:C.white,
-                fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
-                boxShadow:`0 4px 12px ${C.purple}55`,
-              }}>＋ Add Food Item</button>
-              <button onClick={() => downloadCsv("food-items.csv", foodItemsToCsv(items))} disabled={!items.length} className="ht-chip" style={{
-                padding:"8px 16px", borderRadius:10, border:`1px solid ${C.border2}`,
-                background:C.card3, color: items.length ? C.muted : C.border2, fontWeight:700, fontSize:13,
-                cursor: items.length ? "pointer" : "not-allowed", fontFamily:"inherit",
-              }}>⬇ Export CSV</button>
-              <div style={{ marginLeft:"auto", padding:"8px 14px", borderRadius:10, background:`${C.green}15`, border:`1px solid ${C.green}33`, color:C.green, fontSize:12, fontWeight:700 }}>
-                {items.filter(i => i.enabled !== false).length} active · {items.length} total
-              </div>
-            </div>
-          </Card>
-
-          <FoodImportPanel items={items} onImport={onChangeItems}/>
-
-          {!items.length ? (
-            <Card style={{ alignItems:"center", textAlign:"center", padding:32 }}>
-              <div style={{ fontSize:40 }}>🍽️</div>
-              <div style={{ fontSize:14, color:C.muted }}>No food items yet — add one or import a CSV to get started.</div>
-            </Card>
-          ) : (
-            <div className="ht-engine-grid">
-              {items.map((it, i) => (
-                <FoodItemCard key={it.id} item={it}
-                  onChange={(next) => update(i, next)}
-                  onDelete={() => del(i)}
-                  onDuplicate={() => duplicate(i)}/>
-              ))}
-            </div>
-          )}
-        </>
-      )}
     </div>
   );
 }
@@ -3081,10 +3069,12 @@ function ColorPicker({ value, onChange }) {
   );
 }
 
-function Settings({ theme, onChange, onReset }) {
+function Settings({ theme, onChange, onReset, schema, foodSettings, onChangeFoodSettings }) {
   const set = (k, v) => onChange({ ...theme, [k]: v });
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+      <FoodSettingsCard schema={schema} settings={foodSettings} onChange={onChangeFoodSettings}/>
+
       <Card>
         <Label accent={C.purple}>🎨 Theme</Label>
         <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
@@ -3207,10 +3197,7 @@ function PasscodeGate({ onUnlock }) {
     setBusy(true); setErr(null);
     try {
       const url = SHEETS_URL + "?k=" + encodeURIComponent(pc);
-      const res = await fetch(url, { method: "GET", redirect: "follow" });
-      const text = await res.text();
-      if (text.trim().startsWith("<")) throw new Error("Backend unreachable");
-      const json = JSON.parse(text);
+      const json = await fetchJsonWithRetry(url, { method: "GET", redirect: "follow" });
       if (json && json.error === "unauthorized") {
         setErr("Wrong passcode");
         return;
@@ -3309,7 +3296,6 @@ export default function App() {
   const [foodSettings, setFoodSettings] = useState(DEFAULT_FOOD_SETTINGS);
   const [mealTemplates, setMealTemplates] = useState([]);
   const [foodEntries, setFoodEntries] = useState([]);
-  const [foodSeen, setFoodSeen] = useState(() => { try { return !!localStorage.getItem("ht_food_seen_v1"); } catch { return false; } });
   // Auth gate: shown when no passcode yet, or after a 401 from the backend.
   const [locked, setLocked] = useState(() => !getAuth());
 
@@ -3556,18 +3542,9 @@ export default function App() {
     { k:"dashboard", label:"Dashboard", icon:"📊" },
     { k:"log",       label:"Log",       icon:"✍️" },
     { k:"history",   label:"History",   icon:"🗂️" },
-    { k:"food",      label:"Food",      icon:"🍎", isNew:true },
     { k:"engine",    label:"Engine",    icon:"⚙️" },
     { k:"settings",  label:"Settings",  icon:"🎨" },
   ];
-  // Selecting the Food tab dismisses its "NEW" indicator for good.
-  const selectTab = (k) => {
-    setTab(k);
-    if (k === "food" && !foodSeen) {
-      setFoodSeen(true);
-      try { localStorage.setItem("ht_food_seen_v1", "1"); } catch {}
-    }
-  };
 
   if (locked) {
     return <PasscodeGate onUnlock={(pc) => {
@@ -3603,11 +3580,10 @@ export default function App() {
 
           <nav className="ht-tabs">
             {tabs.map(t => (
-              <button key={t.k} onClick={() => selectTab(t.k)}
+              <button key={t.k} onClick={() => setTab(t.k)}
                 className={`ht-tab ${tab===t.k ? "active" : ""}`}>
                 <span className="ht-tab-icon">{t.icon}</span>
                 <span className="ht-tab-label">{t.label}</span>
-                {t.isNew && !foodSeen && <span className="ht-new-pill">NEW</span>}
               </button>
             ))}
           </nav>
@@ -3632,12 +3608,11 @@ export default function App() {
                   <button
                     key={t.k}
                     role="menuitem"
-                    onClick={() => { selectTab(t.k); setMenuOpen(false); }}
+                    onClick={() => { setTab(t.k); setMenuOpen(false); }}
                     className={`ht-menu-item ${tab===t.k ? "active" : ""}`}
                   >
                     <span className="ht-tab-icon">{t.icon}</span>
                     <span>{t.label}</span>
-                    {t.isNew && !foodSeen && <span className="ht-new-pill">NEW</span>}
                     {tab===t.k && <span className="ht-menu-check">✓</span>}
                   </button>
                 ))}
@@ -3671,11 +3646,13 @@ export default function App() {
 
       <main className="ht-main">
         {tab==="dashboard" && <Dashboard scored={scored} schema={schema} onGoLog={() => { onDateChange(getToday()); setTab("log"); }} onPickDate={pickDate}/>}
-        {tab==="log" && <LogEntry form={form} setForm={setForm} live={live} schema={schema} onDateChange={onDateChange} onSave={onSave} saved={saved} onQuickFill={onQuickFill} hasYesterday={!!yesterday}/>}
+        {tab==="log" && <LogEntry form={form} setForm={setForm} live={live} schema={schema} onDateChange={onDateChange} onSave={onSave} saved={saved} onQuickFill={onQuickFill} hasYesterday={!!yesterday}
+          foodItems={foodItems} mealTemplates={mealTemplates} foodEntries={foodEntries} onChangeFoodEntries={updateFoodEntries} foodSettings={foodSettings} onApplyFoodLinks={applyFoodTotalsToHabits}/>}
         {tab==="history" && <History scored={scored} schema={schema} onPick={(e) => { setForm({ ...DFLT(), ...normalizeEntry(e, schema) }); setTab("log"); }}/>}
-        {tab==="food" && <FoodPanel schema={schema} foodItems={foodItems} onChangeItems={updateFoodItems} foodSettings={foodSettings} onChangeSettings={updateFoodSettings} mealTemplates={mealTemplates} onChangeTemplates={updateMealTemplates} foodEntries={foodEntries} onChangeEntries={updateFoodEntries} onApplyLinks={applyFoodTotalsToHabits}/>}
-        {tab==="engine" && <Engine schema={schema} setSchema={updateSchema} entries={entries} onImport={onImport}/>}
-        {tab==="settings" && <Settings theme={theme} onChange={updateTheme} onReset={resetTheme}/>}
+        {tab==="engine" && <Engine schema={schema} setSchema={updateSchema} entries={entries} onImport={onImport}
+          foodItems={foodItems} onChangeFoodItems={updateFoodItems} mealTemplates={mealTemplates} onChangeMealTemplates={updateMealTemplates}/>}
+        {tab==="settings" && <Settings theme={theme} onChange={updateTheme} onReset={resetTheme}
+          schema={schema} foodSettings={foodSettings} onChangeFoodSettings={updateFoodSettings}/>}
       </main>
 
       <footer style={{ textAlign:"center", padding:"24px 16px 12px", color:C.muted2, fontSize:11 }}>
@@ -3754,12 +3731,6 @@ function GlobalStyles() {
       }
       .ht-tab-icon { font-size: 14px; }
       .ht-tab-label { text-transform: uppercase; }
-      .ht-new-pill {
-        font-size: 9px; font-weight: 800; letter-spacing: .5px;
-        padding: 2px 6px; border-radius: 999px; color: ${C.white};
-        background: linear-gradient(135deg, ${C.pink}, ${C.red});
-        animation: pulse 1.6s ease-in-out infinite;
-      }
 
       /* Mobile menu trigger (hidden on desktop) */
       .ht-menu-trigger {
