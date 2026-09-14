@@ -40,6 +40,7 @@ async function dbFetchAll() {
     foodItems:     Array.isArray(json.foodItems) ? json.foodItems : [],
     foodSettings:  (json.foodSettings && typeof json.foodSettings === "object") ? json.foodSettings : null,
     mealTemplates: Array.isArray(json.mealTemplates) ? json.mealTemplates : [],
+    foodEntries:   Array.isArray(json.foodEntries) ? json.foodEntries : [],
   };
 }
 
@@ -174,6 +175,40 @@ const templateTotals = (template, itemsById) => {
   return totals;
 };
 const fmtMacro = (n) => (Math.round((n + Number.EPSILON) * 10) / 10).toString();
+
+/* Daily Food Log — per date: { date, meals:[{id, mealType, items:[{itemId,qty}]}] }.
+ * Meals started "from a template" are copied by value (items only), so later
+ * edits to the template never retroactively change a day already logged. */
+const newBlankMealBlock = (mealType) => ({
+  id:`mb_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
+  mealType, items:[],
+});
+const newMealBlockFromTemplate = (template) => ({
+  id:`mb_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
+  mealType: template.mealType,
+  items: template.items.map(it => ({ ...it })),
+});
+const mealBlockTotals = (block, itemsById) => {
+  const totals = { calories:0, protein:0, carbs:0, fat:0, fibre:0 };
+  (block?.items || []).forEach(ti => {
+    const item = itemsById[ti.itemId];
+    if (!item) return;
+    const n = itemNutrients(item, ti.qty);
+    FOOD_NUTRIENTS.forEach(f => { totals[f.k] += n[f.k]; });
+  });
+  return totals;
+};
+const dayTotals = (dayEntry, itemsById) => {
+  const totals = { calories:0, protein:0, carbs:0, fat:0, fibre:0 };
+  (dayEntry?.meals || []).forEach(block => {
+    const t = mealBlockTotals(block, itemsById);
+    FOOD_NUTRIENTS.forEach(f => { totals[f.k] += t[f.k]; });
+  });
+  return totals;
+};
+// Whether "more" or "less" is the desirable direction for each nutrient —
+// used purely to colour the daily-total vs-target difference.
+const NUTRIENT_DIRECTION = { calories:"cap", protein:"goal", carbs:"cap", fat:"cap", fibre:"goal" };
 
 /* ─────────────── VALIDATION RULES ───────────────
  * Each field has optional `rules: [Rule]`. A Rule looks at OTHER fields in the
@@ -2617,7 +2652,237 @@ function MealTemplatesPanel({ foodItems, templates, onChange }) {
   );
 }
 
-function FoodPanel({ schema, foodItems, onChangeItems, foodSettings, onChangeSettings, mealTemplates, onChangeTemplates }) {
+/* ─────────────── DAILY FOOD LOG ─────────────── */
+function MealBlockEditor({ block, foodItems, onChange, onDelete }) {
+  const itemsById = useMemo(() => Object.fromEntries(foodItems.map(i => [i.id, i])), [foodItems]);
+  const enabledItems = foodItems.filter(i => i.enabled !== false);
+  const [addSel, setAddSel] = useState("");
+  const meal = MEAL_TYPES.find(m => m.k === block.mealType) || MEAL_TYPES[0];
+  const setEntry = (i, qty) => {
+    const items = [...block.items]; items[i] = { ...items[i], qty };
+    onChange({ ...block, items });
+  };
+  const removeEntry = (i) => onChange({ ...block, items: block.items.filter((_, j) => j !== i) });
+  const addEntry = () => {
+    if (!addSel) return;
+    const item = itemsById[addSel];
+    onChange({ ...block, items:[...block.items, { itemId: addSel, qty: item?.servingQty || 1 }] });
+    setAddSel("");
+  };
+  const totals = mealBlockTotals(block, itemsById);
+
+  return (
+    <Card>
+      <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+        <Label accent={C.amber}>{meal.icon} {meal.label}</Label>
+        <select value={block.mealType} onChange={e => onChange({ ...block, mealType: e.target.value })}
+          style={{ ...inputSt, width:"auto", marginLeft:"auto" }}>
+          {MEAL_TYPES.map(m => <option key={m.k} value={m.k}>{m.icon} {m.label}</option>)}
+        </select>
+        <button onClick={onDelete} title="Delete meal" style={{
+          border:`1px solid ${C.red}55`, background:`${C.red}15`, color:C.red,
+          borderRadius:8, padding:"6px 10px", cursor:"pointer", fontSize:12, fontWeight:700,
+        }}>🗑</button>
+      </div>
+
+      <div style={{ overflowX:"auto" }}>
+        <table style={{ width:"100%", fontSize:12, borderCollapse:"collapse", minWidth:520 }}>
+          <thead>
+            <tr>
+              {["Item","Qty", ...FOOD_NUTRIENTS.map(f => `${f.icon} ${f.label}`), ""].map((h,i) => (
+                <th key={i} style={{ padding:"6px 8px", textAlign: i>=2 && i<7 ? "right" : "left", color:C.muted, fontWeight:700, borderBottom:`1px solid ${C.border2}`, whiteSpace:"nowrap" }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {block.items.map((entry, i) => (
+              <MealItemRow key={i} entry={entry} item={itemsById[entry.itemId]}
+                onQtyChange={(q) => setEntry(i, q)} onRemove={() => removeEntry(i)}/>
+            ))}
+            {!block.items.length && (
+              <tr><td colSpan={8} style={{ padding:"10px 8px", color:C.muted, fontSize:12 }}>No items yet — add one below.</td></tr>
+            )}
+          </tbody>
+          {!!block.items.length && (
+            <tfoot>
+              <tr style={{ fontWeight:800 }}>
+                <td style={{ padding:"8px", borderTop:`1px solid ${C.border2}` }}>Meal Total</td>
+                <td style={{ padding:"8px", borderTop:`1px solid ${C.border2}` }}></td>
+                {FOOD_NUTRIENTS.map(f => (
+                  <td key={f.k} style={{ padding:"8px", borderTop:`1px solid ${C.border2}`, textAlign:"right", color:C.cyan }}>{fmtMacro(totals[f.k])}</td>
+                ))}
+                <td style={{ padding:"8px", borderTop:`1px solid ${C.border2}` }}></td>
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      </div>
+
+      <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+        <select value={addSel} onChange={e => setAddSel(e.target.value)} style={{ ...inputSt, flex:"1 1 200px" }}>
+          <option value="">— Choose a food item to add —</option>
+          {enabledItems.map(i => <option key={i.id} value={i.id}>{i.icon} {i.name}</option>)}
+        </select>
+        <button onClick={addEntry} disabled={!addSel} className="ht-chip" style={{
+          padding:"8px 14px", borderRadius:8, border:`1px solid ${C.border2}`,
+          background:C.card3, color: addSel ? C.cyan : C.muted, fontWeight:700, fontSize:12,
+          cursor: addSel ? "pointer" : "not-allowed", fontFamily:"inherit",
+        }}>＋ Add Item</button>
+      </div>
+    </Card>
+  );
+}
+
+function DailyFoodLogPanel({ schema, foodItems, mealTemplates, foodEntries, onChangeEntries, foodSettings, onApplyLinks }) {
+  const [date, setDate] = useState(getToday());
+  const [addMealType, setAddMealType] = useState("breakfast");
+  const [addTemplateId, setAddTemplateId] = useState("");
+  const [status, setStatus] = useState(null);
+  const itemsById = useMemo(() => Object.fromEntries(foodItems.map(i => [i.id, i])), [foodItems]);
+
+  const dayEntry = useMemo(
+    () => foodEntries.find(e => e.date === date) || { date, meals: [] },
+    [foodEntries, date]
+  );
+  const setDayMeals = (meals) => {
+    const next = [...foodEntries.filter(e => e.date !== date)];
+    if (meals.length) next.push({ date, meals });
+    next.sort((a,b) => a.date.localeCompare(b.date));
+    onChangeEntries(next);
+    setStatus(null);
+  };
+  const updateBlock = (i, next) => { const meals = [...dayEntry.meals]; meals[i] = next; setDayMeals(meals); };
+  const deleteBlock = (i) => setDayMeals(dayEntry.meals.filter((_, j) => j !== i));
+  const addBlank = () => setDayMeals([...dayEntry.meals, newBlankMealBlock(addMealType)]);
+  const addFromTemplate = () => {
+    const tpl = mealTemplates.find(t => t.id === addTemplateId);
+    if (!tpl) return;
+    setDayMeals([...dayEntry.meals, newMealBlockFromTemplate(tpl)]);
+    setAddTemplateId("");
+  };
+
+  const totals = dayTotals(dayEntry, itemsById);
+  const targets = foodSettings?.targets || {};
+  const links = foodSettings?.links || {};
+  const linkedCount = FOOD_NUTRIENTS.filter(n => links[n.k]).length;
+
+  const sortedMeals = [...dayEntry.meals].sort(
+    (a,b) => MEAL_TYPES.findIndex(m=>m.k===a.mealType) - MEAL_TYPES.findIndex(m=>m.k===b.mealType)
+  );
+
+  const sync = () => {
+    onApplyLinks(date, totals);
+    setStatus(linkedCount ? `✓ Synced ${linkedCount} linked habit field${linkedCount>1?"s":""} for ${date}` : "No nutrients are linked yet (see Items tab → Daily Targets & Habit Linking).");
+  };
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+      <Card>
+        <Label accent={C.cyan}>📅 Daily Food Log</Label>
+        <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
+          <button onClick={() => setDate(addDays(date, -1))} className="ht-chip" style={{
+            padding:"8px 12px", borderRadius:8, border:`1px solid ${C.border2}`, background:C.card3,
+            color:C.muted, cursor:"pointer", fontWeight:700,
+          }}>‹</button>
+          <input type="date" value={date} onChange={e => setDate(e.target.value || getToday())} style={{ ...inputSt, width:"auto" }}/>
+          <button onClick={() => setDate(addDays(date, 1))} className="ht-chip" style={{
+            padding:"8px 12px", borderRadius:8, border:`1px solid ${C.border2}`, background:C.card3,
+            color:C.muted, cursor:"pointer", fontWeight:700,
+          }}>›</button>
+          <button onClick={() => setDate(getToday())} className="ht-chip" style={{
+            padding:"8px 12px", borderRadius:8, border:`1px solid ${C.border2}`, background:C.card3,
+            color:C.cyan, cursor:"pointer", fontWeight:700, fontSize:12,
+          }}>Today</button>
+        </div>
+
+        <Div/>
+        <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+          <select value={addMealType} onChange={e => setAddMealType(e.target.value)} style={{ ...inputSt, width:"auto" }}>
+            {MEAL_TYPES.map(m => <option key={m.k} value={m.k}>{m.icon} {m.label}</option>)}
+          </select>
+          <button onClick={addBlank} className="ht-chip" style={{
+            padding:"8px 14px", borderRadius:8, border:`1px solid ${C.border2}`,
+            background:C.card3, color:C.text, fontWeight:700, fontSize:12, cursor:"pointer", fontFamily:"inherit",
+          }}>＋ Add Blank Meal</button>
+          <select value={addTemplateId} onChange={e => setAddTemplateId(e.target.value)} style={{ ...inputSt, flex:"1 1 200px" }}>
+            <option value="">— Start from a template —</option>
+            {mealTemplates.map(t => <option key={t.id} value={t.id}>{t.icon} {t.name}</option>)}
+          </select>
+          <button onClick={addFromTemplate} disabled={!addTemplateId} className="ht-cta" style={{
+            padding:"8px 14px", borderRadius:8, border:"none",
+            background: addTemplateId ? `linear-gradient(135deg,${C.violet},${C.purple})` : C.muted,
+            color:C.white, fontWeight:700, fontSize:12,
+            cursor: addTemplateId ? "pointer" : "not-allowed", fontFamily:"inherit",
+          }}>＋ Add From Template</button>
+        </div>
+      </Card>
+
+      {!sortedMeals.length ? (
+        <Card style={{ alignItems:"center", textAlign:"center", padding:32 }}>
+          <div style={{ fontSize:40 }}>🍽️</div>
+          <div style={{ fontSize:14, color:C.muted }}>No meals logged for {fmtFull(date)} yet.</div>
+        </Card>
+      ) : (
+        sortedMeals.map((block) => {
+          const i = dayEntry.meals.indexOf(block);
+          return (
+            <MealBlockEditor key={block.id} block={block} foodItems={foodItems}
+              onChange={(next) => updateBlock(i, next)}
+              onDelete={() => deleteBlock(i)}/>
+          );
+        })
+      )}
+
+      <Card>
+        <Label accent={C.green}>📊 {fmtFull(date)} — Daily Total</Label>
+        <div style={{ overflowX:"auto" }}>
+          <table style={{ width:"100%", fontSize:13, borderCollapse:"collapse" }}>
+            <thead>
+              <tr>
+                {["Nutrient","Your Intake","Target","Difference"].map((h,i) => (
+                  <th key={i} style={{ padding:"6px 8px", textAlign: i===0 ? "left" : "right", color:C.muted, fontWeight:700, borderBottom:`1px solid ${C.border2}` }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {FOOD_NUTRIENTS.map(n => {
+                const intake = totals[n.k];
+                const target = targets[n.k];
+                const hasTarget = target !== undefined && target !== null && target !== "";
+                const diff = hasTarget ? intake - Number(target) : null;
+                const dir = NUTRIENT_DIRECTION[n.k];
+                const good = diff === null ? null : (dir === "cap" ? diff <= 0 : diff >= 0);
+                return (
+                  <tr key={n.k}>
+                    <td style={{ padding:"7px 8px", borderBottom:`1px solid ${C.border}` }}>{n.icon} {n.label}</td>
+                    <td style={{ padding:"7px 8px", borderBottom:`1px solid ${C.border}`, textAlign:"right", fontWeight:700 }}>{fmtMacro(intake)}{n.unit === "kcal" ? " kcal" : ` ${n.unit}`}</td>
+                    <td style={{ padding:"7px 8px", borderBottom:`1px solid ${C.border}`, textAlign:"right", color:C.muted }}>{hasTarget ? `${target}${n.unit === "kcal" ? " kcal" : ` ${n.unit}`}` : "—"}</td>
+                    <td style={{ padding:"7px 8px", borderBottom:`1px solid ${C.border}`, textAlign:"right", fontWeight:700, color: good === null ? C.muted : good ? C.green : C.red }}>
+                      {diff === null ? "—" : `${diff > 0 ? "+" : ""}${fmtMacro(diff)}`}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
+          <button onClick={sync} disabled={!linkedCount} className="ht-cta" style={{
+            padding:"10px 18px", borderRadius:10, border:"none",
+            background: linkedCount ? `linear-gradient(135deg,${C.violet},${C.purple})` : C.muted,
+            color:C.white, fontWeight:700, fontSize:13,
+            cursor: linkedCount ? "pointer" : "not-allowed", fontFamily:"inherit",
+            boxShadow: linkedCount ? `0 4px 12px ${C.purple}55` : "none",
+          }}>🔗 Sync Linked Habit Fields</button>
+          {status && <span style={{ fontSize:12, color:C.muted }}>{status}</span>}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function FoodPanel({ schema, foodItems, onChangeItems, foodSettings, onChangeSettings, mealTemplates, onChangeTemplates, foodEntries, onChangeEntries, onApplyLinks }) {
   const items = foodItems || [];
   const [subTab, setSubTab] = useState("items"); // items | templates
   const update = (i, next) => { const arr = [...items]; arr[i] = next; onChangeItems(arr); };
@@ -2643,6 +2908,7 @@ function FoodPanel({ schema, foodItems, onChangeItems, foodSettings, onChangeSet
         <Segmented value={subTab} onChange={setSubTab} options={[
           { value:"items",     label:"🥫 Items" },
           { value:"templates", label:"🍽️ Meal Templates" },
+          { value:"log",       label:"📅 Daily Log" },
         ]}/>
       </Card>
 
@@ -2650,6 +2916,10 @@ function FoodPanel({ schema, foodItems, onChangeItems, foodSettings, onChangeSet
 
       {subTab === "templates" ? (
         <MealTemplatesPanel foodItems={items} templates={mealTemplates} onChange={onChangeTemplates}/>
+      ) : subTab === "log" ? (
+        <DailyFoodLogPanel schema={schema} foodItems={items} mealTemplates={mealTemplates || []}
+          foodEntries={foodEntries || []} onChangeEntries={onChangeEntries}
+          foodSettings={foodSettings} onApplyLinks={onApplyLinks}/>
       ) : (
         <>
           <Card>
@@ -3038,6 +3308,7 @@ export default function App() {
   const [foodItems, setFoodItems] = useState([]);
   const [foodSettings, setFoodSettings] = useState(DEFAULT_FOOD_SETTINGS);
   const [mealTemplates, setMealTemplates] = useState([]);
+  const [foodEntries, setFoodEntries] = useState([]);
   const [foodSeen, setFoodSeen] = useState(() => { try { return !!localStorage.getItem("ht_food_seen_v1"); } catch { return false; } });
   // Auth gate: shown when no passcode yet, or after a 401 from the backend.
   const [locked, setLocked] = useState(() => !getAuth());
@@ -3057,7 +3328,7 @@ export default function App() {
     (async () => {
       setSync({ state: "syncing", msg: "Loading from Sheet…" });
       try {
-        const { entries: e, schema: s, theme: t, foodItems: fi, foodSettings: fs, mealTemplates: mt } = await dbFetchAll();
+        const { entries: e, schema: s, theme: t, foodItems: fi, foodSettings: fs, mealTemplates: mt, foodEntries: fe } = await dbFetchAll();
         const effSchema = (s && s.length) ? s : DEFAULT_SCHEMA;
         // Normalise time fields immediately so <input type="time"> never sees
         // a Date/fraction round-tripped from Sheets.
@@ -3077,6 +3348,7 @@ export default function App() {
         setFoodItems(Array.isArray(fi) ? fi : []);
         if (fs) setFoodSettings({ targets:{...DEFAULT_FOOD_SETTINGS.targets, ...fs.targets}, links:{...DEFAULT_FOOD_SETTINGS.links, ...fs.links} });
         setMealTemplates(Array.isArray(mt) ? mt : []);
+        setFoodEntries(Array.isArray(fe) ? fe : []);
         setSync({ state: "saved", msg: `Synced · ${e.length} entries`, ts: Date.now() });
       } catch (err) {
         if (err && err.code === 401) {
@@ -3146,6 +3418,43 @@ export default function App() {
       if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
       console.error(err);
       setSync({ state: "error", msg: err.message || "Meal templates save failed" });
+    }
+  };
+  const updateFoodEntries = async (next) => {
+    setFoodEntries(next);
+    setSync({ state: "syncing", msg: "Saving food log…" });
+    try {
+      await dbWrite("foodEntries", next);
+      setSync({ state: "saved", msg: "Food log synced", ts: Date.now() });
+    } catch (err) {
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
+      console.error(err);
+      setSync({ state: "error", msg: err.message || "Food log save failed" });
+    }
+  };
+  // Writes a day's computed nutrient totals into whichever habit fields are
+  // linked (foodSettings.links), merging into that date's habit entry and
+  // re-persisting via the SAME habit `entries` save path as onSave — so it
+  // recomputes score/criteria exactly like a normal log entry would.
+  const applyFoodTotalsToHabits = async (date, totals) => {
+    const links = foodSettings?.links || {};
+    const updates = {};
+    FOOD_NUTRIENTS.forEach(n => { if (links[n.k]) updates[links[n.k]] = Math.round(totals[n.k]); });
+    if (!Object.keys(updates).length) return;
+    const existing = entries.find(e => e.date === date) || { date, isHoliday:false };
+    const merged = { ...existing, ...updates };
+    const { score, criteria, met, total } = calcScore(merged, schema);
+    const finalEntry = { ...merged, score, criteria, met, total };
+    const nextEntries = [...entries.filter(e => e.date !== date), finalEntry].sort((a,b) => a.date.localeCompare(b.date));
+    setEntries(nextEntries);
+    setSync({ state: "syncing", msg: "Syncing linked habit fields…" });
+    try {
+      await dbWrite("entries", nextEntries);
+      setSync({ state: "saved", msg: `Synced · ${nextEntries.length} entries`, ts: Date.now() });
+    } catch (err) {
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
+      console.error(err);
+      setSync({ state: "error", msg: err.message || "Habit field sync failed" });
     }
   };
 
@@ -3364,7 +3673,7 @@ export default function App() {
         {tab==="dashboard" && <Dashboard scored={scored} schema={schema} onGoLog={() => { onDateChange(getToday()); setTab("log"); }} onPickDate={pickDate}/>}
         {tab==="log" && <LogEntry form={form} setForm={setForm} live={live} schema={schema} onDateChange={onDateChange} onSave={onSave} saved={saved} onQuickFill={onQuickFill} hasYesterday={!!yesterday}/>}
         {tab==="history" && <History scored={scored} schema={schema} onPick={(e) => { setForm({ ...DFLT(), ...normalizeEntry(e, schema) }); setTab("log"); }}/>}
-        {tab==="food" && <FoodPanel schema={schema} foodItems={foodItems} onChangeItems={updateFoodItems} foodSettings={foodSettings} onChangeSettings={updateFoodSettings} mealTemplates={mealTemplates} onChangeTemplates={updateMealTemplates}/>}
+        {tab==="food" && <FoodPanel schema={schema} foodItems={foodItems} onChangeItems={updateFoodItems} foodSettings={foodSettings} onChangeSettings={updateFoodSettings} mealTemplates={mealTemplates} onChangeTemplates={updateMealTemplates} foodEntries={foodEntries} onChangeEntries={updateFoodEntries} onApplyLinks={applyFoodTotalsToHabits}/>}
         {tab==="engine" && <Engine schema={schema} setSchema={updateSchema} entries={entries} onImport={onImport}/>}
         {tab==="settings" && <Settings theme={theme} onChange={updateTheme} onReset={resetTheme}/>}
       </main>

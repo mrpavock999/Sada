@@ -39,6 +39,10 @@ const SHEET_SCHEMA  = "Schema";
 const SHEET_ENTRIES = "Entries";
 const SHEET_META    = "Meta";
 const SHEET_LEGACY  = "Data";
+// Daily food log gets its own sheet (one row per date) rather than a Meta
+// blob — like habit Entries, this grows indefinitely and a single JSON cell
+// would eventually hit Sheets' ~50k char/cell limit.
+const SHEET_FOOD_ENTRIES = "FoodEntries";
 
 // Schema columns in display order. `rules` is JSON-encoded.
 const SCHEMA_COLS = [
@@ -230,6 +234,42 @@ function writeEntries_(arr) {
 }
 function typeId(map, c) { return map[c] || null; }
 
+/* ─────────────── Food Entries (daily log) ───────────────
+ * One row per date: { date, meals } where `meals` is a JSON-encoded array
+ * of { id, mealType, items:[{itemId, qty}] }. Fully independent of the
+ * habit Entries sheet — never touched by/touches habit scoring directly;
+ * any habit-field sync happens client-side by writing to habit `entries`.
+ */
+function readFoodEntries_() {
+  const s = ss_().getSheetByName(SHEET_FOOD_ENTRIES);
+  if (!s) return [];
+  const values = s.getDataRange().getValues();
+  if (values.length < 2) return [];
+  const tz = Session.getScriptTimeZone();
+  const out = [];
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i];
+    if (!row[0]) continue;
+    const date = (row[0] instanceof Date)
+      ? Utilities.formatDate(row[0], tz, "yyyy-MM-dd")
+      : String(row[0]);
+    out.push({ date, meals: safeJson_(row[1], []) });
+  }
+  return out;
+}
+function writeFoodEntries_(arr) {
+  if (!Array.isArray(arr)) throw new Error("foodEntries must be an array");
+  const cols = ["date", "meals"];
+  const sh = sheet_(SHEET_FOOD_ENTRIES, cols);
+  sh.clear();
+  sh.appendRow(cols);
+  const dataRows = Math.max(arr.length, 1);
+  sh.getRange(2, 1, dataRows, 1).setNumberFormat("@"); // keep date as plain text
+  const sorted = arr.slice().sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")));
+  const rows = sorted.map(e => [e.date || "", JSON.stringify(e.meals || [])]);
+  if (rows.length) sh.getRange(2, 1, rows.length, cols.length).setValues(rows);
+}
+
 /* ─────────────── Meta (theme & misc) ─────────────── */
 function readMeta_(key) {
   const s = ss_().getSheetByName(SHEET_META);
@@ -281,6 +321,7 @@ function doGet(e) {
       foodItems:     readMeta_("foodItems"),
       foodSettings:  readMeta_("foodSettings"),
       mealTemplates: readMeta_("mealTemplates"),
+      foodEntries:   readFoodEntries_(),
     });
   } catch (err) {
     return jsonOut_({ error: String(err && err.message || err) });
@@ -298,9 +339,10 @@ function doPost(e) {
       return jsonOut_({ error: "Body must be { key, value, k }" });
     }
     switch (body.key) {
-      case "schema":  writeSchema_(body.value);   break;
-      case "entries": writeEntries_(body.value);  break;
-      case "theme":   writeMeta_("theme", body.value); break;
+      case "schema":      writeSchema_(body.value);   break;
+      case "entries":     writeEntries_(body.value);  break;
+      case "theme":       writeMeta_("theme", body.value); break;
+      case "foodEntries": writeFoodEntries_(body.value); break;
       default: writeMeta_(body.key, body.value);  break;
     }
     return jsonOut_({ ok: true, key: body.key });
