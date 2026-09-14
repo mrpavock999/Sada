@@ -278,8 +278,9 @@ function doGet(e) {
       // Food tracking (added later) — stored as plain Meta rows, exactly like
       // `theme`, so old clients/backends round-trip fine (unknown keys are
       // simply ignored by whichever side doesn't recognise them yet).
-      foodItems:    readMeta_("foodItems"),
-      foodSettings: readMeta_("foodSettings"),
+      foodItems:     readMeta_("foodItems"),
+      foodSettings:  readMeta_("foodSettings"),
+      mealTemplates: readMeta_("mealTemplates"),
     });
   } catch (err) {
     return jsonOut_({ error: String(err && err.message || err) });
