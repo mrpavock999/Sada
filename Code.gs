@@ -321,6 +321,7 @@ function doGet(e) {
       foodItems:     readMeta_("foodItems"),
       foodSettings:  readMeta_("foodSettings"),
       mealTemplates: readMeta_("mealTemplates"),
+      mealTypes:     readMeta_("mealTypes"),
       foodEntries:   readFoodEntries_(),
     });
   } catch (err) {
