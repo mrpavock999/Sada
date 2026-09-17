@@ -2202,6 +2202,7 @@ function Engine({ schema, setSchema, entries, onImport, foodItems, onChangeFoodI
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
       <FoodItemModal
+        key={itemModal ? `${itemModal.mode}_${itemModal.index ?? "new"}` : "closed"}
         open={!!itemModal}
         item={itemModal ? (itemModal.mode === "edit" ? foodItems[itemModal.index] : newItemDraft) : null}
         onSave={saveItemModal}
@@ -2402,7 +2403,12 @@ function FoodItemRow({ item, onClick }) {
 function FoodItemModal({ open, item, onSave, onDelete, onClose }) {
   const [draft, setDraft] = useState(item);
   useEffect(() => { if (open) setDraft(item); }, [open, item]);
-  if (!open) return null;
+  // This modal instance stays mounted even while closed, so `draft` can still
+  // be null/stale for one render right after opening — before the effect
+  // above syncs it — since state updates don't apply until the next render.
+  // Guard here to avoid FoodItemFields crashing on a null item (which blanks
+  // the whole app since there's no error boundary).
+  if (!open || !draft) return null;
   return (
     <div onClick={onClose} style={{
       position:"fixed", inset:0, background:"rgba(0,0,0,.7)", backdropFilter:"blur(8px)",
