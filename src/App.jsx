@@ -18,23 +18,40 @@ const getAuth = () => { try { return localStorage.getItem(AUTH_KEY) || ""; } cat
 const setAuth = (v) => { try { v ? localStorage.setItem(AUTH_KEY, v) : localStorage.removeItem(AUTH_KEY); } catch {} };
 class UnauthorizedError extends Error { constructor() { super("unauthorized"); this.code = 401; } }
 
+// Apps Script sometimes serves an HTML "warm up" interstitial for the first
+// request or two right after a fresh deployment, instead of executing the
+// script. It resolves itself within a few seconds, so retry briefly before
+// surfacing an error to the user.
+async function fetchJsonWithRetry(url, options, retries = 2, delayMs = 900) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, options);
+    const text = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0,200)}`);
+    if (text.trim().startsWith("<")) {
+      if (attempt < retries) { await new Promise(r => setTimeout(r, delayMs)); continue; }
+      const m = text.match(/TypeError[^<]*|Error[^<]*/);
+      throw new Error(m ? `Apps Script error: ${m[0]}` : "Backend still deploying — please try again in a few seconds.");
+    }
+    try { return JSON.parse(text); }
+    catch { throw new Error("Sheet returned non-JSON response"); }
+  }
+}
+
 async function dbFetchAll() {
   const url = SHEETS_URL + "?k=" + encodeURIComponent(getAuth());
-  const res = await fetch(url, { method: "GET", redirect: "follow" });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0,200)}`);
-  if (text.trim().startsWith("<")) {
-    const m = text.match(/TypeError[^<]*|Error[^<]*/);
-    throw new Error(`Apps Script error: ${m ? m[0] : "returned HTML, not JSON"}`);
-  }
-  let json;
-  try { json = JSON.parse(text); }
-  catch { throw new Error("Sheet returned non-JSON response"); }
+  const json = await fetchJsonWithRetry(url, { method: "GET", redirect: "follow" });
   if (json && json.error === "unauthorized") throw new UnauthorizedError();
   return {
     entries: Array.isArray(json.entries) ? json.entries : [],
     schema:  Array.isArray(json.schema)  ? json.schema  : null,
     theme:   (json.theme && typeof json.theme === "object") ? json.theme : null,
+    // Food tracking is fully additive — defaults to empty so old backends
+    // (not yet redeployed) or old data never break the rest of the app.
+    foodItems:     Array.isArray(json.foodItems) ? json.foodItems : [],
+    foodSettings:  (json.foodSettings && typeof json.foodSettings === "object") ? json.foodSettings : null,
+    mealTemplates: Array.isArray(json.mealTemplates) ? json.mealTemplates : [],
+    mealTypes:     Array.isArray(json.mealTypes) ? json.mealTypes : null,
+    foodEntries:   Array.isArray(json.foodEntries) ? json.foodEntries : [],
   };
 }
 
@@ -102,6 +119,110 @@ const DEFAULT_SCHEMA = [
   { id:"cleaning",    icon:"🧹", label:"Cleaning",        type:"toggle",  weight:1, enabled:true },
   { id:"movieMinutes",icon:"🎬", label:"Screen Limit",    type:"number",  op:"lte", threshold:90,   holidayThreshold:400, unit:"min", weight:1, enabled:true, targetLabel:"Limit" },
 ];
+
+/* ─────────────── FOOD TRACKING (additive — never touches DEFAULT_SCHEMA/entries) ───────────────
+ * FoodItem: { id, icon, name, basis: "fixed"|"per100", qtyUnit, servingQty,
+ *             calories, protein, carbs, fat, fibre, enabled, notes }
+ *   basis "fixed"   → the macros are the totals for exactly `servingQty` `qtyUnit`
+ *                      (e.g. "1 whole-egg omelette" = 644 kcal, matches AI-agent style logs).
+ *   basis "per100"  → macros are per 100 `qtyUnit`, scaled by however much you log.
+ * FoodSettings: { targets:{calories,protein,carbs,fat,fibre},
+ *                 links:{calories,protein,carbs,fat,fibre} } — each `links.*`
+ *   is an existing habit schema field id (or null). Reserved for the daily
+ *   food log phase: once built, a day's nutrient totals will be able to
+ *   auto-fill the linked habit field so it feeds your existing score engine.
+ */
+const FOOD_NUTRIENTS = [
+  { k:"calories", label:"Calories", unit:"kcal", icon:"🔥" },
+  { k:"protein",  label:"Protein",  unit:"g",    icon:"🍗" },
+  { k:"carbs",    label:"Carbs",    unit:"g",    icon:"🍚" },
+  { k:"fat",      label:"Fat",      unit:"g",    icon:"🥑" },
+  { k:"fibre",    label:"Fibre",    unit:"g",    icon:"🌿" },
+];
+const DEFAULT_FOOD_SETTINGS = {
+  targets: { calories:undefined, protein:undefined, carbs:undefined, fat:undefined, fibre:undefined },
+  links:   { calories:null, protein:null, carbs:null, fat:null, fibre:null },
+};
+const newFoodItem = () => ({
+  id:`food_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
+  icon:"🍽️", name:"New Item", basis:"fixed", qtyUnit:"g", servingQty:100,
+  calories:0, protein:0, carbs:0, fat:0, fibre:0, enabled:true,
+});
+
+/* Meal Templates — a reusable named preset ("Chicken Biryani Lunch") built
+ * from Food Items + qty. `qty` is always expressed in the item's own
+ * `qtyUnit`; nutrients scale linearly against that item's `servingQty`
+ * regardless of `basis` (a "fixed" 64g omelette scales the same way a
+ * "per100" chicken breast does — basis only changes the default/hint).
+ * Meal TYPES themselves are user-customisable (like habit schema) — this is
+ * just the seed set used on first boot / when the sheet has none yet. */
+const DEFAULT_MEAL_TYPES = [
+  { k:"breakfast", label:"Breakfast", icon:"🍳" },
+  { k:"lunch",     label:"Lunch",     icon:"🍗" },
+  { k:"snack",     label:"Snack",     icon:"🍨" },
+  { k:"dinner",    label:"Dinner",    icon:"🌙" },
+];
+const newMealType = () => ({ k:`custom_${Date.now()}_${Math.random().toString(36).slice(2,5)}`, label:"New Meal", icon:"🍽️" });
+const newMealTemplate = (mealTypes) => ({
+  id:`meal_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
+  icon:"🍽️", name:"New Meal", mealType: (mealTypes && mealTypes[0]?.k) || "breakfast", items:[],
+});
+const scaleFactor = (item, qty) => {
+  const ref = Number(item?.servingQty) || 1;
+  const q = Number(qty) || 0;
+  return ref > 0 ? q / ref : 0;
+};
+const itemNutrients = (item, qty) => {
+  const f = scaleFactor(item, qty);
+  const out = {};
+  FOOD_NUTRIENTS.forEach(n => { out[n.k] = (Number(item?.[n.k]) || 0) * f; });
+  return out;
+};
+const templateTotals = (template, itemsById) => {
+  const totals = { calories:0, protein:0, carbs:0, fat:0, fibre:0 };
+  (template?.items || []).forEach(ti => {
+    const item = itemsById[ti.itemId];
+    if (!item) return;
+    const n = itemNutrients(item, ti.qty);
+    FOOD_NUTRIENTS.forEach(f => { totals[f.k] += n[f.k]; });
+  });
+  return totals;
+};
+const fmtMacro = (n) => (Math.round((n + Number.EPSILON) * 10) / 10).toString();
+
+/* Daily Food Log — per date: { date, meals:[{id, mealType, items:[{itemId,qty}]}] }.
+ * Meals started "from a template" are copied by value (items only), so later
+ * edits to the template never retroactively change a day already logged. */
+const newBlankMealBlock = (mealType) => ({
+  id:`mb_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
+  mealType, items:[],
+});
+const newMealBlockFromTemplate = (template) => ({
+  id:`mb_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
+  mealType: template.mealType,
+  items: template.items.map(it => ({ ...it })),
+});
+const mealBlockTotals = (block, itemsById) => {
+  const totals = { calories:0, protein:0, carbs:0, fat:0, fibre:0 };
+  (block?.items || []).forEach(ti => {
+    const item = itemsById[ti.itemId];
+    if (!item) return;
+    const n = itemNutrients(item, ti.qty);
+    FOOD_NUTRIENTS.forEach(f => { totals[f.k] += n[f.k]; });
+  });
+  return totals;
+};
+const dayTotals = (dayEntry, itemsById) => {
+  const totals = { calories:0, protein:0, carbs:0, fat:0, fibre:0 };
+  (dayEntry?.meals || []).forEach(block => {
+    const t = mealBlockTotals(block, itemsById);
+    FOOD_NUTRIENTS.forEach(f => { totals[f.k] += t[f.k]; });
+  });
+  return totals;
+};
+// Whether "more" or "less" is the desirable direction for each nutrient —
+// used purely to colour the daily-total vs-target difference.
+const NUTRIENT_DIRECTION = { calories:"cap", protein:"goal", carbs:"cap", fat:"cap", fibre:"goal" };
 
 /* ─────────────── VALIDATION RULES ───────────────
  * Each field has optional `rules: [Rule]`. A Rule looks at OTHER fields in the
@@ -1045,7 +1166,8 @@ function TargetBadge({ cfg, value }) {
   );
 }
 
-function LogEntry({ form, setForm, live, schema, onDateChange, onSave, saved, onQuickFill, hasYesterday }) {
+function LogEntry({ form, setForm, live, schema, onDateChange, onSave, saved, onQuickFill, hasYesterday,
+  foodItems, mealTemplates, mealTypes, foodEntries, onChangeFoodEntries, foodSettings, onApplyFoodLinks }) {
   const f = (k, v) => setForm(p => ({ ...p, [k]: v }));
   const isFlawless = live.score === 100;
 
@@ -1161,6 +1283,12 @@ function LogEntry({ form, setForm, live, schema, onDateChange, onSave, saved, on
       }}>
         {saved ? "✓ Saved!" : "💾 Save Entry"}
       </button>
+
+      {/* Food tracking for the same day being logged above */}
+      <div style={{ gridColumn:"1 / -1" }}>
+        <DailyFoodLogPanel date={form.date} schema={schema} foodItems={foodItems} mealTemplates={mealTemplates} mealTypes={mealTypes}
+          foodEntries={foodEntries} onChangeEntries={onChangeFoodEntries} foodSettings={foodSettings} onApplyLinks={onApplyFoodLinks}/>
+      </div>
     </div>
   );
 }
@@ -1764,6 +1892,90 @@ function coerceValue(field, raw, schemaField) {
   }
 }
 
+/* ─────────────── FOOD CSV IMPORT/EXPORT HELPERS ─────────────── */
+const FOOD_COLUMN_HINTS = {
+  name:       [/^(item|name|food)$/i],
+  icon:       [/^icon|emoji$/i],
+  basis:      [/^basis$/i],
+  qtyUnit:    [/unit/i],
+  servingQty: [/^qty$|serving\s*(qty|size)/i],
+  calories:   [/cal(ories)?/i],
+  protein:    [/protein/i],
+  carbs:      [/carb/i],
+  fat:        [/^fat$/i],
+  fibre:      [/fib(re|er)/i],
+};
+function autoMapFood(headers) {
+  const map = {};
+  headers.forEach((h, i) => {
+    const txt = String(h || "").trim();
+    if (!txt) { map[i] = "_skip"; return; }
+    let matched = "_skip";
+    for (const [field, patterns] of Object.entries(FOOD_COLUMN_HINTS)) {
+      if (patterns.some(p => p.test(txt))) { matched = field; break; }
+    }
+    map[i] = matched;
+  });
+  return map;
+}
+const FOOD_KNOWN_FIELDS = [
+  { value:"_skip", label:"— Skip —" },
+  { value:"name", label:"name" },
+  { value:"icon", label:"icon" },
+  { value:"basis", label:"basis (fixed/per100)" },
+  { value:"qtyUnit", label:"qtyUnit" },
+  { value:"servingQty", label:"servingQty" },
+  { value:"calories", label:"calories" },
+  { value:"protein", label:"protein" },
+  { value:"carbs", label:"carbs" },
+  { value:"fat", label:"fat" },
+  { value:"fibre", label:"fibre" },
+];
+function coerceFoodValue(field, raw) {
+  if (raw === null || raw === undefined || raw === "") return undefined;
+  if (field === "name" || field === "icon") return String(raw).trim();
+  if (field === "qtyUnit") return String(raw).trim() || "g";
+  if (field === "basis") {
+    const s = String(raw).trim().toLowerCase();
+    return s.startsWith("per") ? "per100" : "fixed";
+  }
+  const n = Number(raw);
+  return isNaN(n) ? undefined : n;
+}
+// Client-side CSV export — no backend round-trip needed, keeps this purely local/no-AI.
+function foodItemsToCsv(items) {
+  const cols = ["name","icon","basis","qtyUnit","servingQty","calories","protein","carbs","fat","fibre","enabled"];
+  const esc = (v) => {
+    const s = v === undefined || v === null ? "" : String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g,'""')}"` : s;
+  };
+  const lines = [cols.join(",")];
+  items.forEach(it => lines.push(cols.map(c => esc(it[c])).join(",")));
+  return lines.join("\n");
+}
+function downloadCsv(filename, csv) {
+  const blob = new Blob([csv], { type:"text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// SheetJS's own codepage sniffing for BOM-less CSV bytes is unreliable and
+// mangles multi-byte characters (emoji icons import as garbled glyphs). CSV
+// files are read as UTF-8 text ourselves instead; binary .xlsx/.xls keep the
+// arrayBuffer path since their internal XML already declares UTF-8.
+async function readWorkbookFile(file) {
+  const XLSX = await import("xlsx");
+  if (/\.csv$/i.test(file.name)) {
+    const text = await file.text();
+    return { XLSX, workbook: XLSX.read(text, { type:"string" }) };
+  }
+  const buf = await file.arrayBuffer();
+  return { XLSX, workbook: XLSX.read(buf, { type:"array", cellDates:false }) };
+}
+
 function ImportPanel({ schema, entries, onImport }) {
   const [rows, setRows] = useState(null);    // [{__row, ...rawCells}]
   const [headers, setHeaders] = useState([]);
@@ -1777,10 +1989,8 @@ function ImportPanel({ schema, entries, onImport }) {
     if (!file) return;
     setBusy(true); setErr(null); setFilename(file.name);
     try {
-      const XLSX = await import("xlsx");
-      const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type:"array", cellDates:false });
-      const ws = wb.Sheets[wb.SheetNames[0]];
+      const { XLSX, workbook } = await readWorkbookFile(file);
+      const ws = workbook.Sheets[workbook.SheetNames[0]];
       const aoa = XLSX.utils.sheet_to_json(ws, { header:1, defval:null, blankrows:false });
       if (!aoa.length) throw new Error("Sheet is empty");
       const hdr = aoa[0].map(h => h == null ? "" : String(h));
@@ -1944,8 +2154,13 @@ function ImportPanel({ schema, entries, onImport }) {
   );
 }
 
-function Engine({ schema, setSchema, entries, onImport }) {
+function Engine({ schema, setSchema, entries, onImport, foodItems, onChangeFoodItems, mealTemplates, onChangeMealTemplates, mealTypes, onChangeMealTypes }) {
   const totalW = schema.filter(c=>c.enabled).reduce((s,c)=>s+(Number(c.weight)||1), 0);
+  const [subTab, setSubTab] = useState("habits"); // habits | items | templates | types
+  const [itemModal, setItemModal] = useState(null); // null | { mode:"add" } | { mode:"edit", index }
+  // Stable "new item" draft for the lifetime of the add-modal being open — recomputing
+  // newFoodItem() inline on every render would reset the draft as the user types.
+  const newItemDraft = useMemo(() => newFoodItem(), [itemModal]);
 
   const update = (i, f) => {
     const next = [...schema]; next[i] = f; setSchema(next);
@@ -1970,44 +2185,983 @@ function Engine({ schema, setSchema, entries, onImport }) {
     setSchema(DEFAULT_SCHEMA);
   };
 
+  // Food Item CRUD (shared with the old standalone Food tab, now here).
+  const foodDel = (i) => {
+    if (!confirm(`Delete "${foodItems[i].name}"?`)) return;
+    onChangeFoodItems(foodItems.filter((_, j) => j !== i));
+  };
+  const saveItemModal = (draft) => {
+    if (itemModal?.mode === "edit") {
+      const arr = [...foodItems]; arr[itemModal.index] = draft; onChangeFoodItems(arr);
+    } else {
+      onChangeFoodItems([...foodItems, draft]);
+    }
+    setItemModal(null);
+  };
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+      <FoodItemModal
+        key={itemModal ? `${itemModal.mode}_${itemModal.index ?? "new"}` : "closed"}
+        open={!!itemModal}
+        item={itemModal ? (itemModal.mode === "edit" ? foodItems[itemModal.index] : newItemDraft) : null}
+        onSave={saveItemModal}
+        onDelete={itemModal?.mode === "edit" ? () => { foodDel(itemModal.index); setItemModal(null); } : null}
+        onClose={() => setItemModal(null)}
+      />
+      <Card>
+        <Segmented value={subTab} onChange={setSubTab} options={[
+          { value:"habits",    label:"⚙️ Habits" },
+          { value:"items",     label:"🥫 Food Items" },
+          { value:"templates", label:"🍽️ Meal Templates" },
+          { value:"types",     label:"🕐 Meal Types" },
+        ]}/>
+      </Card>
+
+      {subTab === "items" ? (
+        <>
+          <Card>
+            <Label accent={C.green}>🥫 Food Item Database</Label>
+            <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
+              Build your own food item database — no AI, no internet required. Add items manually,
+              or bulk-import from a CSV/Excel file you maintain. Click any item to edit it.
+            </div>
+            <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+              <button onClick={() => setItemModal({ mode:"add" })} className="ht-cta" style={{
+                padding:"8px 16px", borderRadius:10, border:"none",
+                background:`linear-gradient(135deg,${C.violet},${C.purple})`, color:C.white,
+                fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
+                boxShadow:`0 4px 12px ${C.purple}55`,
+              }}>＋ Add Food Item</button>
+              <button onClick={() => downloadCsv("food-items.csv", foodItemsToCsv(foodItems))} disabled={!foodItems.length} className="ht-chip" style={{
+                padding:"8px 16px", borderRadius:10, border:`1px solid ${C.border2}`,
+                background:C.card3, color: foodItems.length ? C.muted : C.border2, fontWeight:700, fontSize:13,
+                cursor: foodItems.length ? "pointer" : "not-allowed", fontFamily:"inherit",
+              }}>⬇ Export CSV</button>
+              <div style={{ marginLeft:"auto", padding:"8px 14px", borderRadius:10, background:`${C.green}15`, border:`1px solid ${C.green}33`, color:C.green, fontSize:12, fontWeight:700 }}>
+                {foodItems.filter(i => i.enabled !== false).length} active · {foodItems.length} total
+              </div>
+            </div>
+          </Card>
+
+          <FoodImportPanel items={foodItems} onImport={onChangeFoodItems}/>
+
+          {!foodItems.length ? (
+            <Card style={{ alignItems:"center", textAlign:"center", padding:32 }}>
+              <div style={{ fontSize:40 }}>🍽️</div>
+              <div style={{ fontSize:14, color:C.muted }}>No food items yet — add one or import a CSV to get started.</div>
+            </Card>
+          ) : (
+            <Card style={{ gap:8 }}>
+              {foodItems.map((it, i) => (
+                <FoodItemRow key={it.id} item={it} onClick={() => setItemModal({ mode:"edit", index:i })}/>
+              ))}
+            </Card>
+          )}
+        </>
+      ) : subTab === "templates" ? (
+        <MealTemplatesPanel foodItems={foodItems} templates={mealTemplates} onChange={onChangeMealTemplates} mealTypes={mealTypes}/>
+      ) : subTab === "types" ? (
+        <MealTypesEditor mealTypes={mealTypes} onChange={onChangeMealTypes}/>
+      ) : (
+        <>
+          <Card>
+            <Label accent={C.purple}>⚙️ Score Engine Editor</Label>
+            <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
+              Add, edit, reorder, and weight habits. Score = <b>met weight</b> ÷ <b>total weight</b> × 100.
+            </div>
+            <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+              <button onClick={add} className="ht-cta" style={{
+                padding:"8px 16px", borderRadius:10, border:"none",
+                background:`linear-gradient(135deg,${C.violet},${C.purple})`, color:C.white,
+                fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
+                boxShadow:`0 4px 12px ${C.purple}55`,
+              }}>＋ Add Habit</button>
+              <button onClick={reset} className="ht-chip" style={{
+                padding:"8px 16px", borderRadius:10, border:`1px solid ${C.border2}`,
+                background:C.card3, color:C.muted, fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
+              }}>↺ Reset to Defaults</button>
+              <div style={{ marginLeft:"auto", padding:"8px 14px", borderRadius:10, background:`${C.cyan}15`, border:`1px solid ${C.cyan}33`, color:C.cyan, fontSize:12, fontWeight:700 }}>
+                {schema.filter(c=>c.enabled).length} active · total weight {totalW}
+              </div>
+            </div>
+          </Card>
+
+          <ImportPanel schema={schema} entries={entries} onImport={onImport}/>
+
+          <div className="ht-engine-grid">
+            {schema.map((f, i) => (
+              <FieldEditor
+                key={f.id}
+                field={f}
+                allFields={schema}
+                onChange={(nf) => update(i, nf)}
+                onDelete={() => del(i)}
+                onMove={(dir) => move(i, dir)}
+              />
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ─────────────── FOOD TRACKING ───────────────
+ * Fully additive tab. No-AI, no-internet: everything below runs on data you
+ * enter or CSV-import yourself. Storage rides the same Meta-key mechanism as
+ * `theme` (see dbFetchAll/dbWrite) so it costs zero changes to Schema/Entries
+ * and is safe against old clients/backends — unrecognised keys are ignored.
+ */
+// The editable field body, shared by the add/edit modal. No outer Card here —
+// the modal supplies its own panel chrome.
+function FoodItemFields({ item, onChange }) {
+  const update = (k, v) => onChange({ ...item, [k]: v });
+  return (
+    <>
+      <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+        <input value={item.icon || ""} maxLength={4}
+          onChange={e => update("icon", e.target.value)}
+          style={{ ...inputSt, width:52, textAlign:"center", fontSize:20, padding:"6px 4px" }}/>
+        <input value={item.name || ""} placeholder="Item name"
+          onChange={e => update("name", e.target.value)}
+          style={{ ...inputSt, flex:1, fontWeight:700 }}/>
+        <Toggle value={item.enabled !== false} onChange={v => update("enabled", v)}/>
+      </div>
+
+      <div>
+        <Label>Basis</Label>
+        <Segmented value={item.basis === "per100" ? "per100" : "fixed"} onChange={v => update("basis", v)} options={[
+          { value:"fixed",  label:"Fixed serving" },
+          { value:"per100", label:"Per 100 units" },
+        ]}/>
+        <div style={{ fontSize:10, color:C.muted, marginTop:4 }}>
+          {item.basis === "per100"
+            ? "Macros below are per 100 of the unit — scaled automatically by whatever qty you log."
+            : "Macros below are the total for exactly the serving qty/unit shown (matches how your AI-agent logs read)."}
+        </div>
+      </div>
+
+      <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+        <div style={{ flex:"1 1 100px" }}>
+          <Label>{item.basis === "per100" ? "Per (amount)" : "Serving Qty"}</Label>
+          <input type="number" value={item.servingQty ?? ""} placeholder={item.basis === "per100" ? "100" : "e.g. 64"}
+            onChange={e => update("servingQty", e.target.value === "" ? undefined : Number(e.target.value))}
+            style={inputSt}/>
+        </div>
+        <div style={{ flex:"1 1 100px" }}>
+          <Label>Unit</Label>
+          <input value={item.qtyUnit || ""} placeholder="g / ml / piece"
+            onChange={e => update("qtyUnit", e.target.value)}
+            style={inputSt}/>
+        </div>
+      </div>
+
+      <Div/>
+      <Label accent={C.cyan}>Nutrients</Label>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(90px,1fr))", gap:10 }}>
+        {FOOD_NUTRIENTS.map(n => (
+          <div key={n.k}>
+            <Label>{n.icon} {n.label} ({n.unit})</Label>
+            <input type="number" step="0.1" value={item[n.k] ?? ""} placeholder="0"
+              onChange={e => update(n.k, e.target.value === "" ? undefined : Number(e.target.value))}
+              style={inputSt}/>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+// Compact list row — click anywhere to open the edit modal. Replaces the old
+// always-expanded card grid so long item lists stay scannable.
+function FoodItemRow({ item, onClick }) {
+  return (
+    <button onClick={onClick} className="ht-history-item" style={{
+      display:"flex", alignItems:"center", gap:12, width:"100%", textAlign:"left",
+      padding:"10px 14px", borderRadius:12, cursor:"pointer", fontFamily:"inherit",
+      background:`linear-gradient(135deg,${C.card},${C.card2})`, border:`1px solid ${C.border}`,
+      opacity: item.enabled === false ? .5 : 1,
+    }}>
+      <span style={{ fontSize:22, flexShrink:0 }}>{item.icon}</span>
+      <span style={{ fontWeight:700, color:C.text, flex:"1 1 140px", minWidth:0, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{item.name}</span>
+      <span style={{ fontSize:11, color:C.muted, flexShrink:0 }}>
+        {item.servingQty}{item.qtyUnit}{item.basis === "per100" ? " (per)" : ""}
+      </span>
+      <div style={{ display:"flex", gap:10, flexShrink:0, fontSize:11, color:C.muted }}>
+        {FOOD_NUTRIENTS.map(n => (
+          <span key={n.k} title={n.label}>{n.icon} {fmtMacro(item[n.k] || 0)}</span>
+        ))}
+      </div>
+      <span style={{ color:C.muted, flexShrink:0 }}>›</span>
+    </button>
+  );
+}
+
+// Add/edit modal — editing happens on a local draft; nothing is committed
+// until Save, so cancelling never touches the real list.
+function FoodItemModal({ open, item, onSave, onDelete, onClose }) {
+  const [draft, setDraft] = useState(item);
+  useEffect(() => { if (open) setDraft(item); }, [open, item]);
+  // This modal instance stays mounted even while closed, so `draft` can still
+  // be null/stale for one render right after opening — before the effect
+  // above syncs it — since state updates don't apply until the next render.
+  // Guard here to avoid FoodItemFields crashing on a null item (which blanks
+  // the whole app since there's no error boundary).
+  if (!open || !draft) return null;
+  return (
+    <div onClick={onClose} style={{
+      position:"fixed", inset:0, background:"rgba(0,0,0,.7)", backdropFilter:"blur(8px)",
+      display:"flex", alignItems:"center", justifyContent:"center", zIndex:100, padding:16,
+      animation:"fadeIn .2s ease",
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background:`linear-gradient(135deg,${C.card},${C.card2})`,
+        border:`1px solid ${C.border2}`, borderRadius:18, padding:20,
+        maxWidth:480, width:"100%", maxHeight:"90vh", overflowY:"auto",
+        display:"flex", flexDirection:"column", gap:14,
+        boxShadow:`0 20px 60px ${C.purple}44`, animation:"slideUp .25s ease",
+      }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+          <Label accent={C.green}>{onDelete ? "Edit Food Item" : "New Food Item"}</Label>
+          <button onClick={onClose} className="ht-icon-btn" style={{
+            width:32, height:32, borderRadius:8, border:`1px solid ${C.border2}`,
+            background:C.card3, color:C.text, cursor:"pointer", fontSize:18, fontFamily:"inherit",
+          }}>×</button>
+        </div>
+        <FoodItemFields item={draft} onChange={setDraft}/>
+        <div style={{ display:"flex", gap:10, marginTop:2 }}>
+          {onDelete && (
+            <button onClick={onDelete} className="ht-chip" style={{
+              padding:"9px 16px", borderRadius:8, border:`1px solid ${C.red}55`,
+              background:`${C.red}15`, color:C.red, fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
+            }}>🗑 Delete</button>
+          )}
+          <button onClick={onClose} className="ht-chip" style={{
+            padding:"9px 16px", borderRadius:8, border:`1px solid ${C.border2}`,
+            background:C.card3, color:C.muted, fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
+            marginLeft: onDelete ? 0 : "auto",
+          }}>Cancel</button>
+          <button onClick={() => onSave(draft)} className="ht-cta" style={{
+            padding:"9px 18px", borderRadius:8, border:"none", marginLeft: onDelete ? "auto" : 0,
+            background:`linear-gradient(135deg,${C.violet},${C.purple})`, color:C.white,
+            fontWeight:800, fontSize:13, cursor:"pointer", fontFamily:"inherit",
+            boxShadow:`0 4px 12px ${C.purple}55`,
+          }}>✓ Save</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Meal types are fully user-defined (like habit fields) — breakfast/lunch/
+// snack/dinner are just the seed defaults, not hardcoded categories.
+function MealTypesEditor({ mealTypes, onChange }) {
+  const list = mealTypes || [];
+  const update = (i, patch) => { const next = [...list]; next[i] = { ...next[i], ...patch }; onChange(next); };
+  const del = (i) => {
+    if (list.length <= 1) { alert("You need at least one meal type."); return; }
+    if (!confirm(`Delete "${list[i].label}"?`)) return;
+    onChange(list.filter((_, j) => j !== i));
+  };
+  const add = () => onChange([...list, newMealType()]);
+
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
       <Card>
-        <Label accent={C.purple}>⚙️ Score Engine Editor</Label>
+        <Label accent={C.cyan}>🕐 Meal Types</Label>
         <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
-          Add, edit, reorder, and weight habits. Score = <b>met weight</b> ÷ <b>total weight</b> × 100.
+          Customise which meal categories you use — not limited to Breakfast/Lunch/Snack/Dinner.
+          Rename, re-icon, add, or remove types; templates and logged meals reference them by id.
         </div>
-        <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
-          <button onClick={add} className="ht-cta" style={{
-            padding:"8px 16px", borderRadius:10, border:"none",
-            background:`linear-gradient(135deg,${C.violet},${C.purple})`, color:C.white,
-            fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
-            boxShadow:`0 4px 12px ${C.purple}55`,
-          }}>＋ Add Habit</button>
-          <button onClick={reset} className="ht-chip" style={{
-            padding:"8px 16px", borderRadius:10, border:`1px solid ${C.border2}`,
-            background:C.card3, color:C.muted, fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
-          }}>↺ Reset to Defaults</button>
-          <div style={{ marginLeft:"auto", padding:"8px 14px", borderRadius:10, background:`${C.cyan}15`, border:`1px solid ${C.cyan}33`, color:C.cyan, fontSize:12, fontWeight:700 }}>
-            {schema.filter(c=>c.enabled).length} active · total weight {totalW}
-          </div>
-        </div>
+        <button onClick={add} className="ht-cta" style={{
+          padding:"8px 16px", borderRadius:10, border:"none", width:"fit-content",
+          background:`linear-gradient(135deg,${C.violet},${C.purple})`, color:C.white,
+          fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
+          boxShadow:`0 4px 12px ${C.purple}55`,
+        }}>＋ Add Meal Type</button>
       </Card>
+      <Card style={{ gap:8 }}>
+        {list.map((m, i) => (
+          <div key={m.k} style={{ display:"flex", gap:10, alignItems:"center", padding:"6px 0" }}>
+            <input value={m.icon || ""} maxLength={4}
+              onChange={e => update(i, { icon: e.target.value })}
+              style={{ ...inputSt, width:52, textAlign:"center", fontSize:18, padding:"6px 4px" }}/>
+            <input value={m.label || ""} placeholder="Meal type name"
+              onChange={e => update(i, { label: e.target.value })}
+              style={{ ...inputSt, flex:1, fontWeight:700 }}/>
+            <button onClick={() => del(i)} className="ht-icon-btn" title="Delete" style={{
+              width:32, height:32, borderRadius:8, border:`1px solid ${C.red}33`,
+              background:`${C.red}11`, color:C.red, cursor:"pointer", fontFamily:"inherit",
+            }}>🗑</button>
+          </div>
+        ))}
+      </Card>
+    </div>
+  );
+}
 
-      <ImportPanel schema={schema} entries={entries} onImport={onImport}/>
+function FoodImportPanel({ items, onImport }) {
+  const [rows, setRows] = useState(null);
+  const [headers, setHeaders] = useState([]);
+  const [map, setMap] = useState({});
+  const [mode, setMode] = useState("add"); // add | replace-all | merge-by-name
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [filename, setFilename] = useState("");
 
-      <div className="ht-engine-grid">
-        {schema.map((f, i) => (
-          <FieldEditor
-            key={f.id}
-            field={f}
-            allFields={schema}
-            onChange={(nf) => update(i, nf)}
-            onDelete={() => del(i)}
-            onMove={(dir) => move(i, dir)}
-          />
+  const onFile = async (file) => {
+    if (!file) return;
+    setBusy(true); setErr(null); setFilename(file.name);
+    try {
+      const { XLSX, workbook } = await readWorkbookFile(file);
+      const ws = workbook.Sheets[workbook.SheetNames[0]];
+      const aoa = XLSX.utils.sheet_to_json(ws, { header:1, defval:null, blankrows:false });
+      if (!aoa.length) throw new Error("File is empty");
+      const hdr = aoa[0].map(h => h == null ? "" : String(h));
+      const data = aoa.slice(1).filter(r => r.some(c => c !== null && c !== ""));
+      setHeaders(hdr);
+      setRows(data);
+      setMap(autoMapFood(hdr));
+    } catch (e) {
+      setErr(e.message || String(e));
+      setRows(null);
+    } finally { setBusy(false); }
+  };
+
+  const preview = useMemo(() => {
+    if (!rows) return [];
+    return rows.map(r => {
+      const obj = newFoodItem();
+      delete obj.name;
+      headers.forEach((_, i) => {
+        const f = map[i];
+        if (!f || f === "_skip") return;
+        const v = coerceFoodValue(f, r[i]);
+        if (v !== undefined) obj[f] = v;
+      });
+      return obj;
+    }).filter(o => o.name);
+  }, [rows, headers, map]);
+
+  const doImport = async () => {
+    if (!preview.length) return;
+    let merged;
+    if (mode === "replace-all") merged = preview;
+    else if (mode === "merge-by-name") {
+      const byName = new Map(items.map(it => [it.name.trim().toLowerCase(), it]));
+      preview.forEach(p => {
+        const key = p.name.trim().toLowerCase();
+        const existing = byName.get(key);
+        byName.set(key, existing ? { ...existing, ...p, id: existing.id } : p);
+      });
+      merged = [...byName.values()];
+    } else { // add
+      merged = [...items, ...preview];
+    }
+    setBusy(true); setErr(null);
+    try {
+      await onImport(merged);
+      setRows(null); setHeaders([]); setMap({}); setFilename("");
+    } catch (e) { setErr(e.message || String(e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <Card>
+      <Label accent={C.cyan}>📥 Import Food Items (CSV / Excel)</Label>
+      <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
+        Columns auto-map to name / icon / basis / qtyUnit / servingQty / calories / protein / carbs / fat / fibre. Adjust below, then import. Fully offline — nothing leaves your browser except the final sync to your Sheet.
+      </div>
+
+      <label className="ht-chip" style={{
+        display:"inline-flex", alignItems:"center", gap:8,
+        padding:"10px 16px", borderRadius:10, border:`1.5px dashed ${C.purple}66`,
+        background:`${C.purple}11`, color:C.purple, fontWeight:700, fontSize:13,
+        cursor: busy ? "wait" : "pointer", width:"fit-content",
+      }}>
+        📂 {filename || "Choose CSV / Excel file…"}
+        <input type="file" accept=".xlsx,.xls,.csv" disabled={busy}
+          onChange={e => onFile(e.target.files?.[0])}
+          style={{ display:"none" }}/>
+      </label>
+
+      {err && (
+        <div style={{ padding:12, borderRadius:8, background:`${C.red}15`, border:`1px solid ${C.red}55`, color:C.red, fontSize:13 }}>
+          ⚠️ {err}
+        </div>
+      )}
+
+      {rows && (
+        <>
+          <Div/>
+          <Label>Column Mapping</Label>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr auto 1fr", gap:"8px 12px", alignItems:"center" }}>
+            {headers.map((h, i) => (
+              <div key={i} style={{ display:"contents" }}>
+                <div style={{ fontSize:12, color:C.text, fontWeight:600, padding:"6px 10px", background:C.card3, borderRadius:6, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }} title={h}>
+                  <span style={{ color:C.muted, fontFamily:"monospace", marginRight:6 }}>{String.fromCharCode(65+i)}</span>{h || <em style={{color:C.muted}}>(empty)</em>}
+                </div>
+                <div style={{ color:C.muted, fontSize:14 }}>→</div>
+                <select value={map[i] || "_skip"}
+                  onChange={e => setMap({ ...map, [i]: e.target.value })}
+                  style={{ ...inputSt, padding:"6px 10px", fontSize:12 }}>
+                  {FOOD_KNOWN_FIELDS.map(f => <option key={f.value} value={f.value}>{f.label}</option>)}
+                </select>
+              </div>
+            ))}
+          </div>
+
+          <Div/>
+          <Label>Preview ({preview.length} valid rows)</Label>
+          <div style={{ maxHeight:200, overflow:"auto", border:`1px solid ${C.border}`, borderRadius:8 }}>
+            <table style={{ width:"100%", fontSize:11, borderCollapse:"collapse" }}>
+              <thead style={{ position:"sticky", top:0, background:C.card3 }}>
+                <tr>
+                  {["name","basis","qtyUnit","servingQty","calories","protein","carbs","fat","fibre"].map(k => (
+                    <th key={k} style={{ padding:"6px 8px", textAlign:"left", color:C.muted, fontWeight:700, borderBottom:`1px solid ${C.border}` }}>{k}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {preview.slice(0, 8).map((e, i) => (
+                  <tr key={i} style={{ background: i%2 ? C.card2 : "transparent" }}>
+                    {["name","basis","qtyUnit","servingQty","calories","protein","carbs","fat","fibre"].map(k => (
+                      <td key={k} style={{ padding:"5px 8px", color:C.text, borderBottom:`1px solid ${C.border}`, whiteSpace:"nowrap" }}>{String(e[k] ?? "")}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <Div/>
+          <Label>Import Mode</Label>
+          <Segmented value={mode} onChange={setMode} options={[
+            { value:"add",           label:"Add as new" },
+            { value:"merge-by-name", label:"Merge by name" },
+            { value:"replace-all",   label:"Replace all items" },
+          ]}/>
+          <div style={{ fontSize:11, color:C.muted, marginTop:-6 }}>
+            {mode === "add" && "Every row becomes a brand-new item, even if a similar name exists."}
+            {mode === "merge-by-name" && "Rows matching an existing item name update it; new names are added."}
+            {mode === "replace-all" && "⚠️ Your entire Food Item list is replaced with this file's contents."}
+          </div>
+
+          <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+            <button onClick={doImport} disabled={busy || !preview.length} className="ht-cta" style={{
+              padding:"10px 18px", borderRadius:10, border:"none",
+              background: busy ? C.muted : `linear-gradient(135deg,${C.violet},${C.purple})`,
+              color:C.white, fontWeight:700, fontSize:13,
+              cursor: busy ? "wait" : "pointer", fontFamily:"inherit",
+              boxShadow:`0 4px 12px ${C.purple}55`,
+            }}>{busy ? "Importing…" : `📥 Import ${preview.length} Items`}</button>
+            <button onClick={() => { setRows(null); setHeaders([]); setMap({}); setFilename(""); }} className="ht-chip" style={{
+              padding:"10px 18px", borderRadius:10, border:`1px solid ${C.border2}`,
+              background:C.card3, color:C.muted, fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit",
+            }}>Cancel</button>
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
+function FoodSettingsCard({ schema, settings, onChange }) {
+  const s = { targets:{...DEFAULT_FOOD_SETTINGS.targets, ...settings?.targets}, links:{...DEFAULT_FOOD_SETTINGS.links, ...settings?.links} };
+  const setTarget = (k, v) => onChange({ ...s, targets:{ ...s.targets, [k]: v === "" ? undefined : Number(v) } });
+  const setLink = (k, v) => onChange({ ...s, links:{ ...s.links, [k]: v || null } });
+  // Only number/stepper habit fields make sense as a numeric nutrient link.
+  const linkable = schema.filter(f => f.type === "number" || f.type === "stepper");
+  return (
+    <Card>
+      <Label accent={C.purple}>🎯 Daily Targets & Habit Linking</Label>
+      <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
+        Set your daily nutrient targets. Optionally link a nutrient to an existing habit field —
+        from the Log tab's Food Tracking section, hitting "Sync Linked Habit Fields" will write that
+        day's total into the linked field so it factors into your score, with no double entry.
+      </div>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))", gap:14 }}>
+        {FOOD_NUTRIENTS.map(n => (
+          <div key={n.k} style={{ display:"flex", flexDirection:"column", gap:6, padding:12, borderRadius:10, background:C.card3, border:`1px solid ${C.border2}` }}>
+            <Label>{n.icon} {n.label} target ({n.unit})</Label>
+            <input type="number" value={s.targets[n.k] ?? ""} placeholder="e.g. 1800"
+              onChange={e => setTarget(n.k, e.target.value)}
+              style={inputSt}/>
+            <Label>Link to habit field</Label>
+            <select value={s.links[n.k] || ""} onChange={e => setLink(n.k, e.target.value)} style={inputSt}>
+              <option value="">— None —</option>
+              {linkable.map(f => <option key={f.id} value={f.id}>{f.icon} {f.label}</option>)}
+            </select>
+          </div>
         ))}
       </div>
+    </Card>
+  );
+}
+
+// Searchable food item combobox — replaces plain <select> pickers so long
+// item lists stay usable. Selecting a result adds it immediately.
+function FoodItemPicker({ items, onPick, placeholder = "🔍 Search food items to add…" }) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const list = q ? items.filter(i => i.name.toLowerCase().includes(q)) : items;
+    return list.slice(0, 30);
+  }, [items, query]);
+
+  return (
+    <div style={{ position:"relative", flex:"1 1 220px" }}>
+      <input value={query} placeholder={placeholder}
+        onChange={e => { setQuery(e.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        style={inputSt}/>
+      {open && (
+        <div style={{
+          position:"absolute", top:"calc(100% + 4px)", left:0, right:0, zIndex:20,
+          maxHeight:220, overflowY:"auto", background:C.card2, border:`1px solid ${C.border2}`,
+          borderRadius:10, boxShadow:"0 12px 32px rgba(0,0,0,.4)",
+        }}>
+          {filtered.length ? filtered.map(i => (
+            <button key={i.id} type="button"
+              onMouseDown={e => { e.preventDefault(); onPick(i); setQuery(""); setOpen(false); }}
+              onMouseEnter={e => { e.currentTarget.style.background = C.card3; }}
+              onMouseLeave={e => { e.currentTarget.style.background = "transparent"; }}
+              style={{
+                display:"flex", alignItems:"center", gap:8, width:"100%", padding:"8px 10px",
+                border:"none", background:"transparent", color:C.text, cursor:"pointer",
+                fontSize:13, textAlign:"left", fontFamily:"inherit",
+              }}>
+              <span style={{ fontSize:16, flexShrink:0 }}>{i.icon}</span>
+              <span style={{ flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{i.name}</span>
+              <span style={{ fontSize:10, color:C.muted, flexShrink:0 }}>{i.servingQty}{i.qtyUnit}</span>
+            </button>
+          )) : (
+            <div style={{ padding:"10px 12px", color:C.muted, fontSize:12 }}>No matches.</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MealItemRow({ entry, item, onQtyChange, onRemove }) {
+  const n = item ? itemNutrients(item, entry.qty) : null;
+  return (
+    <tr>
+      <td style={{ padding:"6px 8px", color:C.text, borderBottom:`1px solid ${C.border}` }}>
+        {item ? `${item.icon || ""} ${item.name}` : <em style={{ color:C.red }}>(deleted item)</em>}
+      </td>
+      <td style={{ padding:"6px 8px", borderBottom:`1px solid ${C.border}` }}>
+        <div style={{ display:"flex", alignItems:"center", gap:4 }}>
+          <input type="number" value={entry.qty ?? ""} placeholder="0"
+            onChange={e => onQtyChange(e.target.value === "" ? undefined : Number(e.target.value))}
+            style={{ ...inputSt, width:70, padding:"4px 8px" }}/>
+          <span style={{ fontSize:11, color:C.muted }}>{item?.qtyUnit || ""}</span>
+        </div>
+      </td>
+      {FOOD_NUTRIENTS.map(f => (
+        <td key={f.k} style={{ padding:"6px 8px", color:C.text, borderBottom:`1px solid ${C.border}`, textAlign:"right", fontVariantNumeric:"tabular-nums" }}>
+          {n ? fmtMacro(n[f.k]) : "—"}
+        </td>
+      ))}
+      <td style={{ padding:"6px 8px", borderBottom:`1px solid ${C.border}` }}>
+        <button onClick={onRemove} title="Remove" style={{
+          border:"none", background:"transparent", color:C.red, cursor:"pointer", fontSize:14,
+        }}>✕</button>
+      </td>
+    </tr>
+  );
+}
+
+function MealTemplateEditor({ template, foodItems, mealTypes, onChange, onDelete, onDuplicate }) {
+  const itemsById = useMemo(() => Object.fromEntries(foodItems.map(i => [i.id, i])), [foodItems]);
+  const enabledItems = foodItems.filter(i => i.enabled !== false);
+  const update = (k, v) => onChange({ ...template, [k]: v });
+  const setEntry = (i, qty) => {
+    const items = [...template.items];
+    items[i] = { ...items[i], qty };
+    onChange({ ...template, items });
+  };
+  const removeEntry = (i) => onChange({ ...template, items: template.items.filter((_, j) => j !== i) });
+  const addItem = (item) => onChange({ ...template, items:[...template.items, { itemId: item.id, qty: item.servingQty || 1 }] });
+  const totals = templateTotals(template, itemsById);
+
+  return (
+    <Card>
+      <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
+        <input value={template.icon || ""} maxLength={4}
+          onChange={e => update("icon", e.target.value)}
+          style={{ ...inputSt, width:52, textAlign:"center", fontSize:20, padding:"6px 4px" }}/>
+        <input value={template.name || ""} placeholder="Meal name"
+          onChange={e => update("name", e.target.value)}
+          style={{ ...inputSt, flex:"1 1 160px", fontWeight:700 }}/>
+        <Segmented value={template.mealType} onChange={v => update("mealType", v)}
+          options={mealTypes.map(m => ({ value:m.k, label:`${m.icon} ${m.label}` }))}/>
+      </div>
+
+      <Div/>
+      <div style={{ overflowX:"auto" }}>
+        <table style={{ width:"100%", fontSize:12, borderCollapse:"collapse", minWidth:520 }}>
+          <thead>
+            <tr>
+              {["Item","Qty", ...FOOD_NUTRIENTS.map(f => `${f.icon} ${f.label}`), ""].map((h,i) => (
+                <th key={i} style={{ padding:"6px 8px", textAlign: i>=2 && i<7 ? "right" : "left", color:C.muted, fontWeight:700, borderBottom:`1px solid ${C.border2}`, whiteSpace:"nowrap" }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {template.items.map((entry, i) => (
+              <MealItemRow key={i} entry={entry} item={itemsById[entry.itemId]}
+                onQtyChange={(q) => setEntry(i, q)} onRemove={() => removeEntry(i)}/>
+            ))}
+            {!template.items.length && (
+              <tr><td colSpan={8} style={{ padding:"10px 8px", color:C.muted, fontSize:12 }}>No items yet — add one below.</td></tr>
+            )}
+          </tbody>
+          {!!template.items.length && (
+            <tfoot>
+              <tr style={{ fontWeight:800 }}>
+                <td style={{ padding:"8px", borderTop:`1px solid ${C.border2}` }}>Meal Total</td>
+                <td style={{ padding:"8px", borderTop:`1px solid ${C.border2}` }}></td>
+                {FOOD_NUTRIENTS.map(f => (
+                  <td key={f.k} style={{ padding:"8px", borderTop:`1px solid ${C.border2}`, textAlign:"right", color:C.cyan }}>{fmtMacro(totals[f.k])}</td>
+                ))}
+                <td style={{ padding:"8px", borderTop:`1px solid ${C.border2}` }}></td>
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      </div>
+
+      <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+        <FoodItemPicker items={enabledItems} onPick={addItem}/>
+      </div>
+
+      <div style={{ display:"flex", gap:10, marginTop:2 }}>
+        <button onClick={onDuplicate} className="ht-chip" style={{
+          padding:"7px 14px", borderRadius:8, border:`1px solid ${C.border2}`,
+          background:C.card3, color:C.muted, fontWeight:700, fontSize:12, cursor:"pointer", fontFamily:"inherit",
+        }}>⧉ Duplicate</button>
+        <button onClick={onDelete} className="ht-chip" style={{
+          padding:"7px 14px", borderRadius:8, border:`1px solid ${C.red}55`,
+          background:`${C.red}15`, color:C.red, fontWeight:700, fontSize:12, cursor:"pointer", fontFamily:"inherit",
+          marginLeft:"auto",
+        }}>🗑 Delete</button>
+      </div>
+    </Card>
+  );
+}
+
+function MealTemplatesPanel({ foodItems, templates, onChange, mealTypes }) {
+  const list = templates || [];
+  const [filter, setFilter] = useState("all");
+  const update = (i, next) => { const arr = [...list]; arr[i] = next; onChange(arr); };
+  const del = (i) => {
+    if (!confirm(`Delete "${list[i].name}"?`)) return;
+    onChange(list.filter((_, j) => j !== i));
+  };
+  const duplicate = (i) => {
+    const copy = { ...list[i], id:`meal_${Date.now()}_${Math.random().toString(36).slice(2,7)}`, name:`${list[i].name} (copy)` };
+    onChange([...list.slice(0, i+1), copy, ...list.slice(i+1)]);
+  };
+  const add = () => onChange([...list, newMealTemplate(mealTypes)]);
+  const visible = filter === "all" ? list : list.filter(t => t.mealType === filter);
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+      <Card>
+        <Label accent={C.amber}>🍽️ Meal Templates</Label>
+        <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
+          Build reusable meals from your Food Item DB (e.g. "Chicken Biryani Lunch"). These are
+          starting points — when meal logging arrives, you can tweak qty or add/remove items
+          per day without changing the saved template.
+        </div>
+        <div style={{ display:"flex", gap:10, flexWrap:"wrap", alignItems:"center" }}>
+          <button onClick={add} disabled={!foodItems.length} className="ht-cta" style={{
+            padding:"8px 16px", borderRadius:10, border:"none",
+            background: foodItems.length ? `linear-gradient(135deg,${C.violet},${C.purple})` : C.muted,
+            color:C.white, fontWeight:700, fontSize:13,
+            cursor: foodItems.length ? "pointer" : "not-allowed", fontFamily:"inherit",
+            boxShadow: foodItems.length ? `0 4px 12px ${C.purple}55` : "none",
+          }}>＋ Add Meal Template</button>
+          <Segmented value={filter} onChange={setFilter} options={[
+            { value:"all", label:"All" },
+            ...mealTypes.map(m => ({ value:m.k, label:`${m.icon} ${m.label}` })),
+          ]}/>
+          <div style={{ marginLeft:"auto", padding:"8px 14px", borderRadius:10, background:`${C.amber}15`, border:`1px solid ${C.amber}33`, color:C.amber, fontSize:12, fontWeight:700 }}>
+            {list.length} template{list.length === 1 ? "" : "s"}
+          </div>
+        </div>
+        {!foodItems.length && (
+          <div style={{ fontSize:12, color:C.muted }}>Add at least one Food Item first (Engine → 🥫 Food Items) before building a meal template.</div>
+        )}
+      </Card>
+
+      {!visible.length ? (
+        <Card style={{ alignItems:"center", textAlign:"center", padding:32 }}>
+          <div style={{ fontSize:40 }}>🍽️</div>
+          <div style={{ fontSize:14, color:C.muted }}>No meal templates yet.</div>
+        </Card>
+      ) : (
+        <div className="ht-engine-grid">
+          {list.map((t, i) => (filter === "all" || t.mealType === filter) && (
+            <MealTemplateEditor key={t.id} template={t} foodItems={foodItems} mealTypes={mealTypes}
+              onChange={(next) => update(i, next)}
+              onDelete={() => del(i)}
+              onDuplicate={() => duplicate(i)}/>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─────────────── DAILY FOOD LOG ─────────────── */
+// Collapsed by default: shows meal icon/label + macro totals inline. Expand
+// to edit items. The whole row is draggable (see DailyFoodLogPanel) so meals
+// can be reordered within the day.
+function MealBlockEditor({ block, foodItems, mealTypes, expanded, onToggleExpand, onChange, onDelete }) {
+  const itemsById = useMemo(() => Object.fromEntries(foodItems.map(i => [i.id, i])), [foodItems]);
+  const enabledItems = foodItems.filter(i => i.enabled !== false);
+  const meal = mealTypes.find(m => m.k === block.mealType) || mealTypes[0] || { icon:"🍽️", label:"Meal" };
+  const setEntry = (i, qty) => {
+    const items = [...block.items]; items[i] = { ...items[i], qty };
+    onChange({ ...block, items });
+  };
+  const removeEntry = (i) => onChange({ ...block, items: block.items.filter((_, j) => j !== i) });
+  const addItem = (item) => onChange({ ...block, items:[...block.items, { itemId: item.id, qty: item.servingQty || 1 }] });
+  const totals = mealBlockTotals(block, itemsById);
+
+  return (
+    <Card style={{ padding: expanded ? 16 : "10px 14px", gap: expanded ? 14 : 0 }}>
+      <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+        <span style={{ cursor:"grab", color:C.muted, fontSize:15, userSelect:"none", flexShrink:0 }} title="Drag to reorder">⠿</span>
+        <button onClick={onToggleExpand} className="ht-icon-btn" style={{
+          width:26, height:26, borderRadius:7, border:`1px solid ${C.border2}`,
+          background:C.card3, color:C.muted, cursor:"pointer", fontSize:13, fontFamily:"inherit", flexShrink:0,
+        }}>{expanded ? "▾" : "▸"}</button>
+        <span style={{ fontSize:18, flexShrink:0 }}>{meal.icon}</span>
+        <span style={{ fontWeight:700, color:C.text, flexShrink:0 }}>{meal.label}</span>
+        <div style={{ marginLeft:"auto", display:"flex", gap:10, flexWrap:"wrap", fontSize:11, color:C.muted, justifyContent:"flex-end" }}>
+          {FOOD_NUTRIENTS.map(f => (
+            <span key={f.k} title={f.label}>{f.icon} {fmtMacro(totals[f.k])}</span>
+          ))}
+        </div>
+        <button onClick={onDelete} title="Delete meal" style={{
+          border:`1px solid ${C.red}55`, background:`${C.red}15`, color:C.red,
+          borderRadius:8, padding:"5px 9px", cursor:"pointer", fontSize:12, fontWeight:700, flexShrink:0,
+        }}>🗑</button>
+      </div>
+
+      {expanded && (
+        <>
+          <Div/>
+          <div>
+            <Label>Meal Type</Label>
+            <select value={block.mealType} onChange={e => onChange({ ...block, mealType: e.target.value })} style={{ ...inputSt, width:"auto" }}>
+              {mealTypes.map(m => <option key={m.k} value={m.k}>{m.icon} {m.label}</option>)}
+            </select>
+          </div>
+
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ width:"100%", fontSize:12, borderCollapse:"collapse", minWidth:520 }}>
+              <thead>
+                <tr>
+                  {["Item","Qty", ...FOOD_NUTRIENTS.map(f => `${f.icon} ${f.label}`), ""].map((h,i) => (
+                    <th key={i} style={{ padding:"6px 8px", textAlign: i>=2 && i<7 ? "right" : "left", color:C.muted, fontWeight:700, borderBottom:`1px solid ${C.border2}`, whiteSpace:"nowrap" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {block.items.map((entry, i) => (
+                  <MealItemRow key={i} entry={entry} item={itemsById[entry.itemId]}
+                    onQtyChange={(q) => setEntry(i, q)} onRemove={() => removeEntry(i)}/>
+                ))}
+                {!block.items.length && (
+                  <tr><td colSpan={8} style={{ padding:"10px 8px", color:C.muted, fontSize:12 }}>No items yet — add one below.</td></tr>
+                )}
+              </tbody>
+              {!!block.items.length && (
+                <tfoot>
+                  <tr style={{ fontWeight:800 }}>
+                    <td style={{ padding:"8px", borderTop:`1px solid ${C.border2}` }}>Meal Total</td>
+                    <td style={{ padding:"8px", borderTop:`1px solid ${C.border2}` }}></td>
+                    {FOOD_NUTRIENTS.map(f => (
+                      <td key={f.k} style={{ padding:"8px", borderTop:`1px solid ${C.border2}`, textAlign:"right", color:C.cyan }}>{fmtMacro(totals[f.k])}</td>
+                    ))}
+                    <td style={{ padding:"8px", borderTop:`1px solid ${C.border2}` }}></td>
+                  </tr>
+                </tfoot>
+              )}
+            </table>
+          </div>
+
+          <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+            <FoodItemPicker items={enabledItems} onPick={addItem}/>
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
+function DailyFoodLogPanel({ date, schema, foodItems, mealTemplates, mealTypes, foodEntries, onChangeEntries, foodSettings, onApplyLinks }) {
+  const [addMealType, setAddMealType] = useState(mealTypes[0]?.k || "");
+  const [addTemplateId, setAddTemplateId] = useState("");
+  const [status, setStatus] = useState(null);
+  const [expanded, setExpanded] = useState(() => new Set());
+  const [dragIndex, setDragIndex] = useState(null);
+  const itemsById = useMemo(() => Object.fromEntries(foodItems.map(i => [i.id, i])), [foodItems]);
+
+  const dayEntry = useMemo(
+    () => foodEntries.find(e => e.date === date) || { date, meals: [] },
+    [foodEntries, date]
+  );
+  const setDayMeals = (meals) => {
+    const next = [...foodEntries.filter(e => e.date !== date)];
+    if (meals.length) next.push({ date, meals });
+    next.sort((a,b) => a.date.localeCompare(b.date));
+    onChangeEntries(next);
+    setStatus(null);
+  };
+  const updateBlock = (i, next) => { const meals = [...dayEntry.meals]; meals[i] = next; setDayMeals(meals); };
+  const deleteBlock = (i) => setDayMeals(dayEntry.meals.filter((_, j) => j !== i));
+  const toggleExpand = (id) => setExpanded(prev => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const addBlank = () => {
+    const block = newBlankMealBlock(addMealType || mealTypes[0]?.k);
+    setDayMeals([...dayEntry.meals, block]);
+    setExpanded(prev => new Set(prev).add(block.id));
+  };
+  const addFromTemplate = () => {
+    const tpl = mealTemplates.find(t => t.id === addTemplateId);
+    if (!tpl) return;
+    const block = newMealBlockFromTemplate(tpl);
+    setDayMeals([...dayEntry.meals, block]);
+    setExpanded(prev => new Set(prev).add(block.id));
+    setAddTemplateId("");
+  };
+  const reorder = (from, to) => {
+    if (from === to) return;
+    const meals = [...dayEntry.meals];
+    const [moved] = meals.splice(from, 1);
+    meals.splice(to, 0, moved);
+    setDayMeals(meals);
+  };
+
+  const totals = dayTotals(dayEntry, itemsById);
+  const targets = foodSettings?.targets || {};
+  const links = foodSettings?.links || {};
+  const linkedCount = FOOD_NUTRIENTS.filter(n => links[n.k]).length;
+
+  const sync = () => {
+    onApplyLinks(date, totals);
+    setStatus(linkedCount ? `✓ Synced ${linkedCount} linked habit field${linkedCount>1?"s":""} for ${date}` : "No nutrients are linked yet (see Settings → Food Targets & Habit Linking).");
+  };
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+      <Card>
+        <Label accent={C.cyan}>🍎 Food Tracking — {fmtFull(date)}</Label>
+        <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+          <select value={addMealType} onChange={e => setAddMealType(e.target.value)} style={{ ...inputSt, width:"auto" }}>
+            {mealTypes.map(m => <option key={m.k} value={m.k}>{m.icon} {m.label}</option>)}
+          </select>
+          <button onClick={addBlank} className="ht-chip" style={{
+            padding:"8px 14px", borderRadius:8, border:`1px solid ${C.border2}`,
+            background:C.card3, color:C.text, fontWeight:700, fontSize:12, cursor:"pointer", fontFamily:"inherit",
+          }}>＋ Add Blank Meal</button>
+          <select value={addTemplateId} onChange={e => setAddTemplateId(e.target.value)} style={{ ...inputSt, flex:"1 1 200px" }}>
+            <option value="">— Start from a template —</option>
+            {mealTemplates.map(t => <option key={t.id} value={t.id}>{t.icon} {t.name}</option>)}
+          </select>
+          <button onClick={addFromTemplate} disabled={!addTemplateId} className="ht-cta" style={{
+            padding:"8px 14px", borderRadius:8, border:"none",
+            background: addTemplateId ? `linear-gradient(135deg,${C.violet},${C.purple})` : C.muted,
+            color:C.white, fontWeight:700, fontSize:12,
+            cursor: addTemplateId ? "pointer" : "not-allowed", fontFamily:"inherit",
+          }}>＋ Add From Template</button>
+        </div>
+        {!!dayEntry.meals.length && (
+          <div style={{ fontSize:11, color:C.muted }}>⠿ Drag a meal's handle to reorder it.</div>
+        )}
+      </Card>
+
+      {!dayEntry.meals.length ? (
+        <Card style={{ alignItems:"center", textAlign:"center", padding:32 }}>
+          <div style={{ fontSize:40 }}>🍽️</div>
+          <div style={{ fontSize:14, color:C.muted }}>No meals logged for {fmtFull(date)} yet.</div>
+        </Card>
+      ) : (
+        dayEntry.meals.map((block, i) => (
+          <div key={block.id}
+            draggable
+            onDragStart={() => setDragIndex(i)}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={() => { if (dragIndex !== null) { reorder(dragIndex, i); setDragIndex(null); } }}
+            onDragEnd={() => setDragIndex(null)}
+          >
+            <MealBlockEditor block={block} foodItems={foodItems} mealTypes={mealTypes}
+              expanded={expanded.has(block.id)}
+              onToggleExpand={() => toggleExpand(block.id)}
+              onChange={(next) => updateBlock(i, next)}
+              onDelete={() => deleteBlock(i)}/>
+          </div>
+        ))
+      )}
+
+
+      <Card>
+        <Label accent={C.green}>📊 {fmtFull(date)} — Daily Total</Label>
+        <div style={{ overflowX:"auto" }}>
+          <table style={{ width:"100%", fontSize:13, borderCollapse:"collapse" }}>
+            <thead>
+              <tr>
+                {["Nutrient","Your Intake","Target","Difference"].map((h,i) => (
+                  <th key={i} style={{ padding:"6px 8px", textAlign: i===0 ? "left" : "right", color:C.muted, fontWeight:700, borderBottom:`1px solid ${C.border2}` }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {FOOD_NUTRIENTS.map(n => {
+                const intake = totals[n.k];
+                const target = targets[n.k];
+                const hasTarget = target !== undefined && target !== null && target !== "";
+                const diff = hasTarget ? intake - Number(target) : null;
+                const dir = NUTRIENT_DIRECTION[n.k];
+                const good = diff === null ? null : (dir === "cap" ? diff <= 0 : diff >= 0);
+                return (
+                  <tr key={n.k}>
+                    <td style={{ padding:"7px 8px", borderBottom:`1px solid ${C.border}` }}>{n.icon} {n.label}</td>
+                    <td style={{ padding:"7px 8px", borderBottom:`1px solid ${C.border}`, textAlign:"right", fontWeight:700 }}>{fmtMacro(intake)}{n.unit === "kcal" ? " kcal" : ` ${n.unit}`}</td>
+                    <td style={{ padding:"7px 8px", borderBottom:`1px solid ${C.border}`, textAlign:"right", color:C.muted }}>{hasTarget ? `${target}${n.unit === "kcal" ? " kcal" : ` ${n.unit}`}` : "—"}</td>
+                    <td style={{ padding:"7px 8px", borderBottom:`1px solid ${C.border}`, textAlign:"right", fontWeight:700, color: good === null ? C.muted : good ? C.green : C.red }}>
+                      {diff === null ? "—" : `${diff > 0 ? "+" : ""}${fmtMacro(diff)}`}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
+          <button onClick={sync} disabled={!linkedCount} className="ht-cta" style={{
+            padding:"10px 18px", borderRadius:10, border:"none",
+            background: linkedCount ? `linear-gradient(135deg,${C.violet},${C.purple})` : C.muted,
+            color:C.white, fontWeight:700, fontSize:13,
+            cursor: linkedCount ? "pointer" : "not-allowed", fontFamily:"inherit",
+            boxShadow: linkedCount ? `0 4px 12px ${C.purple}55` : "none",
+          }}>🔗 Sync Linked Habit Fields</button>
+          {status && <span style={{ fontSize:12, color:C.muted }}>{status}</span>}
+        </div>
+      </Card>
     </div>
   );
 }
@@ -2129,10 +3283,12 @@ function ColorPicker({ value, onChange }) {
   );
 }
 
-function Settings({ theme, onChange, onReset }) {
+function Settings({ theme, onChange, onReset, schema, foodSettings, onChangeFoodSettings }) {
   const set = (k, v) => onChange({ ...theme, [k]: v });
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+      <FoodSettingsCard schema={schema} settings={foodSettings} onChange={onChangeFoodSettings}/>
+
       <Card>
         <Label accent={C.purple}>🎨 Theme</Label>
         <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
@@ -2255,10 +3411,7 @@ function PasscodeGate({ onUnlock }) {
     setBusy(true); setErr(null);
     try {
       const url = SHEETS_URL + "?k=" + encodeURIComponent(pc);
-      const res = await fetch(url, { method: "GET", redirect: "follow" });
-      const text = await res.text();
-      if (text.trim().startsWith("<")) throw new Error("Backend unreachable");
-      const json = JSON.parse(text);
+      const json = await fetchJsonWithRetry(url, { method: "GET", redirect: "follow" });
       if (json && json.error === "unauthorized") {
         setErr("Wrong passcode");
         return;
@@ -2352,6 +3505,12 @@ export default function App() {
   const [, setThemeVersion] = useState(0);
   // Day-detail modal: { ds: "YYYY-MM-DD" } | null
   const [dayDetail, setDayDetail] = useState(null);
+  // Food tracking (additive) — empty/default until you add items or a CSV.
+  const [foodItems, setFoodItems] = useState([]);
+  const [foodSettings, setFoodSettings] = useState(DEFAULT_FOOD_SETTINGS);
+  const [mealTemplates, setMealTemplates] = useState([]);
+  const [mealTypes, setMealTypes] = useState(DEFAULT_MEAL_TYPES);
+  const [foodEntries, setFoodEntries] = useState([]);
   // Auth gate: shown when no passcode yet, or after a 401 from the backend.
   const [locked, setLocked] = useState(() => !getAuth());
 
@@ -2370,7 +3529,7 @@ export default function App() {
     (async () => {
       setSync({ state: "syncing", msg: "Loading from Sheet…" });
       try {
-        const { entries: e, schema: s, theme: t } = await dbFetchAll();
+        const { entries: e, schema: s, theme: t, foodItems: fi, foodSettings: fs, mealTemplates: mt, mealTypes: mty, foodEntries: fe } = await dbFetchAll();
         const effSchema = (s && s.length) ? s : DEFAULT_SCHEMA;
         // Normalise time fields immediately so <input type="time"> never sees
         // a Date/fraction round-tripped from Sheets.
@@ -2386,6 +3545,12 @@ export default function App() {
           Object.assign(C, merged);
           setThemeVersion(v => v + 1);
         }
+        // Food tracking: purely additive, defaults keep existing data/UI untouched.
+        setFoodItems(Array.isArray(fi) ? fi : []);
+        if (fs) setFoodSettings({ targets:{...DEFAULT_FOOD_SETTINGS.targets, ...fs.targets}, links:{...DEFAULT_FOOD_SETTINGS.links, ...fs.links} });
+        setMealTemplates(Array.isArray(mt) ? mt : []);
+        setMealTypes((Array.isArray(mty) && mty.length) ? mty : DEFAULT_MEAL_TYPES);
+        setFoodEntries(Array.isArray(fe) ? fe : []);
         setSync({ state: "saved", msg: `Synced · ${e.length} entries`, ts: Date.now() });
       } catch (err) {
         if (err && err.code === 401) {
@@ -2418,6 +3583,98 @@ export default function App() {
     }
   };
   const resetTheme = () => updateTheme(DEFAULT_THEME);
+
+  // Persist food items / settings the same way theme/schema do — independent
+  // of the habit save flow, so a failure here never blocks habit logging.
+  const updateFoodItems = async (next) => {
+    setFoodItems(next);
+    setSync({ state: "syncing", msg: "Saving food items…" });
+    try {
+      await dbWrite("foodItems", next);
+      setSync({ state: "saved", msg: "Food items synced", ts: Date.now() });
+    } catch (err) {
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
+      console.error(err);
+      setSync({ state: "error", msg: err.message || "Food items save failed" });
+    }
+  };
+  const updateFoodSettings = async (next) => {
+    setFoodSettings(next);
+    setSync({ state: "syncing", msg: "Saving food settings…" });
+    try {
+      await dbWrite("foodSettings", next);
+      setSync({ state: "saved", msg: "Food settings synced", ts: Date.now() });
+    } catch (err) {
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
+      console.error(err);
+      setSync({ state: "error", msg: err.message || "Food settings save failed" });
+    }
+  };
+  const updateMealTemplates = async (next) => {
+    setMealTemplates(next);
+    setSync({ state: "syncing", msg: "Saving meal templates…" });
+    try {
+      await dbWrite("mealTemplates", next);
+      setSync({ state: "saved", msg: "Meal templates synced", ts: Date.now() });
+    } catch (err) {
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
+      console.error(err);
+      setSync({ state: "error", msg: err.message || "Meal templates save failed" });
+    }
+  };
+  const updateMealTypes = async (next) => {
+    setMealTypes(next);
+    setSync({ state: "syncing", msg: "Saving meal types…" });
+    try {
+      await dbWrite("mealTypes", next);
+      setSync({ state: "saved", msg: "Meal types synced", ts: Date.now() });
+    } catch (err) {
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
+      console.error(err);
+      setSync({ state: "error", msg: err.message || "Meal types save failed" });
+    }
+  };
+  const updateFoodEntries = async (next) => {
+    setFoodEntries(next);
+    setSync({ state: "syncing", msg: "Saving food log…" });
+    try {
+      await dbWrite("foodEntries", next);
+      setSync({ state: "saved", msg: "Food log synced", ts: Date.now() });
+    } catch (err) {
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
+      console.error(err);
+      setSync({ state: "error", msg: err.message || "Food log save failed" });
+    }
+  };
+  // Writes a day's computed nutrient totals into whichever habit fields are
+  // linked (foodSettings.links), merging into that date's habit entry and
+  // re-persisting via the SAME habit `entries` save path as onSave — so it
+  // recomputes score/criteria exactly like a normal log entry would.
+  const applyFoodTotalsToHabits = async (date, totals) => {
+    const links = foodSettings?.links || {};
+    const updates = {};
+    FOOD_NUTRIENTS.forEach(n => { if (links[n.k]) updates[links[n.k]] = Math.round(totals[n.k]); });
+    if (!Object.keys(updates).length) return;
+    const existing = entries.find(e => e.date === date) || { date, isHoliday:false };
+    const merged = { ...existing, ...updates };
+    const { score, criteria, met, total } = calcScore(merged, schema);
+    const finalEntry = { ...merged, score, criteria, met, total };
+    const nextEntries = [...entries.filter(e => e.date !== date), finalEntry].sort((a,b) => a.date.localeCompare(b.date));
+    setEntries(nextEntries);
+    // The Log tab's `form` is a separate working copy of the entry being
+    // edited — without this, the linked field visibly stayed unchanged and a
+    // later "Save Entry" would overwrite entries[] with the stale form value.
+    if (form.date === date) setForm(f => ({ ...f, ...updates }));
+    setSync({ state: "syncing", msg: "Syncing linked habit fields…" });
+    try {
+      await dbWrite("entries", nextEntries);
+      setSync({ state: "saved", msg: `Synced · ${nextEntries.length} entries`, ts: Date.now() });
+    } catch (err) {
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
+      console.error(err);
+      setSync({ state: "error", msg: err.message || "Habit field sync failed" });
+    }
+  };
 
   // Persist schema to sheet only when user actually edits it (via updateSchema).
   const updateSchema = async (next) => {
@@ -2621,10 +3878,14 @@ export default function App() {
 
       <main className="ht-main">
         {tab==="dashboard" && <Dashboard scored={scored} schema={schema} onGoLog={() => { onDateChange(getToday()); setTab("log"); }} onPickDate={pickDate}/>}
-        {tab==="log" && <LogEntry form={form} setForm={setForm} live={live} schema={schema} onDateChange={onDateChange} onSave={onSave} saved={saved} onQuickFill={onQuickFill} hasYesterday={!!yesterday}/>}
+        {tab==="log" && <LogEntry form={form} setForm={setForm} live={live} schema={schema} onDateChange={onDateChange} onSave={onSave} saved={saved} onQuickFill={onQuickFill} hasYesterday={!!yesterday}
+          foodItems={foodItems} mealTemplates={mealTemplates} mealTypes={mealTypes} foodEntries={foodEntries} onChangeFoodEntries={updateFoodEntries} foodSettings={foodSettings} onApplyFoodLinks={applyFoodTotalsToHabits}/>}
         {tab==="history" && <History scored={scored} schema={schema} onPick={(e) => { setForm({ ...DFLT(), ...normalizeEntry(e, schema) }); setTab("log"); }}/>}
-        {tab==="engine" && <Engine schema={schema} setSchema={updateSchema} entries={entries} onImport={onImport}/>}
-        {tab==="settings" && <Settings theme={theme} onChange={updateTheme} onReset={resetTheme}/>}
+        {tab==="engine" && <Engine schema={schema} setSchema={updateSchema} entries={entries} onImport={onImport}
+          foodItems={foodItems} onChangeFoodItems={updateFoodItems} mealTemplates={mealTemplates} onChangeMealTemplates={updateMealTemplates}
+          mealTypes={mealTypes} onChangeMealTypes={updateMealTypes}/>}
+        {tab==="settings" && <Settings theme={theme} onChange={updateTheme} onReset={resetTheme}
+          schema={schema} foodSettings={foodSettings} onChangeFoodSettings={updateFoodSettings}/>}
       </main>
 
       <footer style={{ textAlign:"center", padding:"24px 16px 12px", color:C.muted2, fontSize:11 }}>
