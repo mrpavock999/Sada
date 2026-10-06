@@ -12,7 +12,7 @@ import {
  * mismatches with HTTP 200 + { error:"unauthorized" }. The passcode lives in
  * localStorage; the gate component below collects it on first load.
  */
-const SHEETS_URL = "https://script.google.com/macros/s/AKfycbzaxRUVz7vRqDw6Mf0-xowdLhc9rEVWGSJTzrsoBvOSHPrE7h8uB0zzxWeUI1hq0_pQeQ/exec";
+const SHEETS_URL = "https://script.google.com/macros/s/AKfycby0sSHdVT7CpBk2JWcIxXdzflMH8Xbj23v05cEu9lGAGFC1kJh51JKkaMB_Xvj0Gt8LaQ/exec";
 const AUTH_KEY = "ht_auth_v1";
 const getAuth = () => { try { return localStorage.getItem(AUTH_KEY) || ""; } catch { return ""; } };
 const setAuth = (v) => { try { v ? localStorage.setItem(AUTH_KEY, v) : localStorage.removeItem(AUTH_KEY); } catch {} };
