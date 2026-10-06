@@ -26,8 +26,15 @@ async function fetchJsonWithRetry(url, options, retries = 2, delayMs = 900) {
   for (let attempt = 0; ; attempt++) {
     const res = await fetch(url, options);
     const text = await res.text();
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0,200)}`);
-    if (text.trim().startsWith("<")) {
+    const isHtml = text.trim().startsWith("<");
+    if (!res.ok) {
+      if (res.status === 404 && isHtml && attempt < retries) {
+        await new Promise(r => setTimeout(r, delayMs * (attempt + 1)));
+        continue;
+      }
+      throw new Error(`HTTP ${res.status}${isHtml ? ": Apps Script returned an HTML error page" : `: ${text.slice(0,200)}`}`);
+    }
+    if (isHtml) {
       if (attempt < retries) { await new Promise(r => setTimeout(r, delayMs)); continue; }
       const m = text.match(/TypeError[^<]*|Error[^<]*/);
       throw new Error(m ? `Apps Script error: ${m[0]}` : "Backend still deploying — please try again in a few seconds.");
@@ -57,21 +64,14 @@ async function dbFetchAll() {
 
 async function dbWrite(key, value) {
   // text/plain avoids CORS preflight; Apps Script still reads e.postData.contents
-  const res = await fetch(SHEETS_URL, {
+  const json = await fetchJsonWithRetry(SHEETS_URL, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
     body: JSON.stringify({ key, value, k: getAuth() }),
     redirect: "follow",
   });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0,200)}`);
-  if (text.trim().startsWith("<")) {
-    const m = text.match(/TypeError[^<]*|Error[^<]*/);
-    throw new Error(`Apps Script error: ${m ? m[0] : "returned HTML, not JSON"}`);
-  }
-  let json;
-  try { json = JSON.parse(text); } catch { return { ok:true }; }
   if (json && json.error === "unauthorized") throw new UnauthorizedError();
+  if (json && json.error) throw new Error(`Apps Script: ${json.error}`);
   return json;
 }
 
