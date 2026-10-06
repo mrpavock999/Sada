@@ -311,19 +311,22 @@ function doGet(e) {
   try {
     const auth = e && e.parameter && e.parameter.k;
     if (!checkAuth_(auth)) return unauthorized_();
-    return jsonOut_({
-      entries: readEntries_(),
-      schema:  readSchema_(),
-      theme:   readMeta_("theme"),
-      // Food tracking (added later) — stored as plain Meta rows, exactly like
-      // `theme`, so old clients/backends round-trip fine (unknown keys are
-      // simply ignored by whichever side doesn't recognise them yet).
-      foodItems:     readMeta_("foodItems"),
-      foodSettings:  readMeta_("foodSettings"),
-      mealTemplates: readMeta_("mealTemplates"),
-      mealTypes:     readMeta_("mealTypes"),
-      foodEntries:   readFoodEntries_(),
-    });
+    const lock = LockService.getScriptLock();
+    lock.waitLock(10000);
+    try {
+      return jsonOut_({
+        entries: readEntries_(),
+        schema:  readSchema_(),
+        theme:   readMeta_("theme"),
+        foodItems:     readMeta_("foodItems"),
+        foodSettings:  readMeta_("foodSettings"),
+        mealTemplates: readMeta_("mealTemplates"),
+        mealTypes:     readMeta_("mealTypes"),
+        foodEntries:   readFoodEntries_(),
+      });
+    } finally {
+      lock.releaseLock();
+    }
   } catch (err) {
     return jsonOut_({ error: String(err && err.message || err) });
   }
@@ -339,12 +342,18 @@ function doPost(e) {
     if (!body || typeof body.key !== "string") {
       return jsonOut_({ error: "Body must be { key, value, k }" });
     }
-    switch (body.key) {
-      case "schema":      writeSchema_(body.value);   break;
-      case "entries":     writeEntries_(body.value);  break;
-      case "theme":       writeMeta_("theme", body.value); break;
-      case "foodEntries": writeFoodEntries_(body.value); break;
-      default: writeMeta_(body.key, body.value);  break;
+    const lock = LockService.getScriptLock();
+    lock.waitLock(10000);
+    try {
+      switch (body.key) {
+        case "schema":      writeSchema_(body.value);   break;
+        case "entries":     writeEntries_(body.value);  break;
+        case "theme":       writeMeta_("theme", body.value); break;
+        case "foodEntries": writeFoodEntries_(body.value); break;
+        default: writeMeta_(body.key, body.value);  break;
+      }
+    } finally {
+      lock.releaseLock();
     }
     return jsonOut_({ ok: true, key: body.key });
   } catch (err) {

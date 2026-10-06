@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from "recharts";
@@ -1167,7 +1167,8 @@ function TargetBadge({ cfg, value }) {
 }
 
 function LogEntry({ form, setForm, live, schema, onDateChange, onSave, saved, onQuickFill, hasYesterday,
-  foodItems, mealTemplates, mealTypes, foodEntries, onChangeFoodEntries, foodSettings, onApplyFoodLinks }) {
+  foodItems, mealTemplates, mealTypes, foodEntries, onChangeFoodEntries, foodSettings, onApplyFoodLinks,
+  foodLogDirty, foodLogSaving, onSaveFoodLog, onDiscardFoodLog }) {
   const f = (k, v) => setForm(p => ({ ...p, [k]: v }));
   const isFlawless = live.score === 100;
 
@@ -1287,7 +1288,8 @@ function LogEntry({ form, setForm, live, schema, onDateChange, onSave, saved, on
       {/* Food tracking for the same day being logged above */}
       <div style={{ gridColumn:"1 / -1" }}>
         <DailyFoodLogPanel date={form.date} schema={schema} foodItems={foodItems} mealTemplates={mealTemplates} mealTypes={mealTypes}
-          foodEntries={foodEntries} onChangeEntries={onChangeFoodEntries} foodSettings={foodSettings} onApplyLinks={onApplyFoodLinks}/>
+          foodEntries={foodEntries} onChangeEntries={onChangeFoodEntries} foodSettings={foodSettings} onApplyLinks={onApplyFoodLinks}
+          foodLogDirty={foodLogDirty} foodLogSaving={foodLogSaving} onSaveFoodLog={onSaveFoodLog} onDiscardFoodLog={onDiscardFoodLog}/>
       </div>
     </div>
   );
@@ -2224,7 +2226,8 @@ function Engine({ schema, setSchema, entries, onImport, foodItems, onChangeFoodI
             <Label accent={C.green}>🥫 Food Item Database</Label>
             <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
               Build your own food item database — no AI, no internet required. Add items manually,
-              or bulk-import from a CSV/Excel file you maintain. Click any item to edit it.
+              or bulk-import from a CSV/Excel file you maintain. Click any item to edit it;
+              use the Save Food Setup bar to commit these changes to the Sheet.
             </div>
             <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
               <button onClick={() => setItemModal({ mode:"add" })} className="ht-cta" style={{
@@ -2447,7 +2450,7 @@ function FoodItemModal({ open, item, onSave, onDelete, onClose }) {
             background:`linear-gradient(135deg,${C.violet},${C.purple})`, color:C.white,
             fontWeight:800, fontSize:13, cursor:"pointer", fontFamily:"inherit",
             boxShadow:`0 4px 12px ${C.purple}55`,
-          }}>✓ Save</button>
+          }}>✓ Apply</button>
         </div>
       </div>
     </div>
@@ -2679,7 +2682,8 @@ function FoodSettingsCard({ schema, settings, onChange }) {
       <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
         Set your daily nutrient targets. Optionally link a nutrient to an existing habit field —
         from the Log tab's Food Tracking section, hitting "Sync Linked Habit Fields" will write that
-        day's total into the linked field so it factors into your score, with no double entry.
+          day's total into the linked field so it factors into your score, with no double entry.
+          Target and link edits stay pending until you choose Save Food Setup.
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))", gap:14 }}>
         {FOOD_NUTRIENTS.map(n => (
@@ -2876,8 +2880,8 @@ function MealTemplatesPanel({ foodItems, templates, onChange, mealTypes }) {
         <Label accent={C.amber}>🍽️ Meal Templates</Label>
         <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
           Build reusable meals from your Food Item DB (e.g. "Chicken Biryani Lunch"). These are
-          starting points — when meal logging arrives, you can tweak qty or add/remove items
-          per day without changing the saved template.
+          starting points — in the Log tab you can tweak qty or add/remove items for a day
+          without changing the template. Template edits are committed with Save Food Setup.
         </div>
         <div style={{ display:"flex", gap:10, flexWrap:"wrap", alignItems:"center" }}>
           <button onClick={add} disabled={!foodItems.length} className="ht-cta" style={{
@@ -3008,7 +3012,7 @@ function MealBlockEditor({ block, foodItems, mealTypes, expanded, onToggleExpand
   );
 }
 
-function DailyFoodLogPanel({ date, schema, foodItems, mealTemplates, mealTypes, foodEntries, onChangeEntries, foodSettings, onApplyLinks }) {
+function DailyFoodLogPanel({ date, schema, foodItems, mealTemplates, mealTypes, foodEntries, onChangeEntries, foodSettings, onApplyLinks, foodLogDirty, foodLogSaving, onSaveFoodLog, onDiscardFoodLog }) {
   const [addMealType, setAddMealType] = useState(mealTypes[0]?.k || "");
   const [addTemplateId, setAddTemplateId] = useState("");
   const [status, setStatus] = useState(null);
@@ -3060,9 +3064,16 @@ function DailyFoodLogPanel({ date, schema, foodItems, mealTemplates, mealTypes, 
   const links = foodSettings?.links || {};
   const linkedCount = FOOD_NUTRIENTS.filter(n => links[n.k]).length;
 
-  const sync = () => {
-    onApplyLinks(date, totals);
-    setStatus(linkedCount ? `✓ Synced ${linkedCount} linked habit field${linkedCount>1?"s":""} for ${date}` : "No nutrients are linked yet (see Settings → Food Targets & Habit Linking).");
+  const sync = async () => {
+    if (foodLogDirty && !(await onSaveFoodLog())) {
+      setStatus("Food log was not saved; linked habit fields were not synced.");
+      return;
+    }
+    const applied = await onApplyLinks(date, totals);
+    setStatus(applied
+      ? `✓ Synced ${linkedCount} linked habit field${linkedCount>1?"s":""} for ${date}`
+      : linkedCount ? "Could not sync linked habit fields; check the sync status above." : "No nutrients are linked yet (see Settings → Food Targets & Habit Linking)."
+    );
   };
 
   return (
@@ -3152,6 +3163,22 @@ function DailyFoodLogPanel({ date, schema, foodItems, mealTemplates, mealTypes, 
         </div>
 
         <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
+          {foodLogDirty && <span style={{ color:C.amber, fontSize:12, fontWeight:700 }}>● Unsaved food log changes</span>}
+          {foodLogDirty && (
+            <>
+              <button onClick={onDiscardFoodLog} disabled={foodLogSaving} className="ht-chip" style={{
+                padding:"9px 14px", borderRadius:9, border:`1px solid ${C.border2}`,
+                background:C.card3, color:C.muted, fontWeight:700, fontSize:12,
+                cursor:foodLogSaving ? "wait" : "pointer", fontFamily:"inherit",
+              }}>Discard</button>
+              <button onClick={onSaveFoodLog} disabled={foodLogSaving} className="ht-cta" style={{
+                padding:"9px 16px", borderRadius:9, border:"none",
+                background:foodLogSaving ? C.muted : `linear-gradient(135deg,${C.violet},${C.purple})`,
+                color:C.white, fontWeight:800, fontSize:12,
+                cursor:foodLogSaving ? "wait" : "pointer", fontFamily:"inherit",
+              }}>{foodLogSaving ? "Saving…" : "💾 Save Food Log"}</button>
+            </>
+          )}
           <button onClick={sync} disabled={!linkedCount} className="ht-cta" style={{
             padding:"10px 18px", borderRadius:10, border:"none",
             background: linkedCount ? `linear-gradient(135deg,${C.violet},${C.purple})` : C.muted,
@@ -3511,6 +3538,21 @@ export default function App() {
   const [mealTemplates, setMealTemplates] = useState([]);
   const [mealTypes, setMealTypes] = useState(DEFAULT_MEAL_TYPES);
   const [foodEntries, setFoodEntries] = useState([]);
+  const [foodSetupDirty, setFoodSetupDirty] = useState(false);
+  const [foodSetupSaving, setFoodSetupSaving] = useState(false);
+  const [foodLogDirty, setFoodLogDirty] = useState(false);
+  const [foodLogSaving, setFoodLogSaving] = useState(false);
+  const foodSetupDirtyRef = useRef(false);
+  const foodLogDirtyRef = useRef(false);
+  const foodSetupRevision = useRef(0);
+  const foodLogRevision = useRef(0);
+  const foodSetupSaveLock = useRef(false);
+  const foodLogSaveLock = useRef(false);
+  const savedFoodSetup = useRef({
+    foodItems: [], foodSettings: DEFAULT_FOOD_SETTINGS,
+    mealTemplates: [], mealTypes: DEFAULT_MEAL_TYPES,
+  });
+  const savedFoodEntries = useRef([]);
   // Auth gate: shown when no passcode yet, or after a 401 from the backend.
   const [locked, setLocked] = useState(() => !getAuth());
 
@@ -3546,11 +3588,25 @@ export default function App() {
           setThemeVersion(v => v + 1);
         }
         // Food tracking: purely additive, defaults keep existing data/UI untouched.
-        setFoodItems(Array.isArray(fi) ? fi : []);
-        if (fs) setFoodSettings({ targets:{...DEFAULT_FOOD_SETTINGS.targets, ...fs.targets}, links:{...DEFAULT_FOOD_SETTINGS.links, ...fs.links} });
-        setMealTemplates(Array.isArray(mt) ? mt : []);
-        setMealTypes((Array.isArray(mty) && mty.length) ? mty : DEFAULT_MEAL_TYPES);
-        setFoodEntries(Array.isArray(fe) ? fe : []);
+        const loadedFoodSetup = {
+          foodItems: Array.isArray(fi) ? fi : [],
+          foodSettings: fs ? { targets:{...DEFAULT_FOOD_SETTINGS.targets, ...fs.targets}, links:{...DEFAULT_FOOD_SETTINGS.links, ...fs.links} } : DEFAULT_FOOD_SETTINGS,
+          mealTemplates: Array.isArray(mt) ? mt : [],
+          mealTypes: (Array.isArray(mty) && mty.length) ? mty : DEFAULT_MEAL_TYPES,
+        };
+        if (!foodSetupDirtyRef.current) {
+          setFoodItems(loadedFoodSetup.foodItems);
+          setFoodSettings(loadedFoodSetup.foodSettings);
+          setMealTemplates(loadedFoodSetup.mealTemplates);
+          setMealTypes(loadedFoodSetup.mealTypes);
+        }
+        savedFoodSetup.current = JSON.parse(JSON.stringify(loadedFoodSetup));
+        setFoodSetupDirty(foodSetupDirtyRef.current);
+        foodSetupRevision.current++;
+        if (!foodLogDirtyRef.current) setFoodEntries(Array.isArray(fe) ? fe : []);
+        savedFoodEntries.current = JSON.parse(JSON.stringify(Array.isArray(fe) ? fe : []));
+        setFoodLogDirty(foodLogDirtyRef.current);
+        foodLogRevision.current++;
         setSync({ state: "saved", msg: `Synced · ${e.length} entries`, ts: Date.now() });
       } catch (err) {
         if (err && err.code === 401) {
@@ -3566,6 +3622,16 @@ export default function App() {
       }
     })();
   }, [locked, bootNonce]);
+
+  useEffect(() => {
+    if (!foodSetupDirty && !foodLogDirty) return;
+    const warnBeforeLeaving = (event) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeLeaving);
+    return () => window.removeEventListener("beforeunload", warnBeforeLeaving);
+  }, [foodSetupDirty, foodLogDirty]);
 
   // Mutate global palette + persist theme to sheet.
   const updateTheme = async (next) => {
@@ -3584,67 +3650,108 @@ export default function App() {
   };
   const resetTheme = () => updateTheme(DEFAULT_THEME);
 
-  // Persist food items / settings the same way theme/schema do — independent
-  // of the habit save flow, so a failure here never blocks habit logging.
-  const updateFoodItems = async (next) => {
+  const editFoodItems = (next) => {
     setFoodItems(next);
-    setSync({ state: "syncing", msg: "Saving food items…" });
-    try {
-      await dbWrite("foodItems", next);
-      setSync({ state: "saved", msg: "Food items synced", ts: Date.now() });
-    } catch (err) {
-      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
-      console.error(err);
-      setSync({ state: "error", msg: err.message || "Food items save failed" });
-    }
+    foodSetupRevision.current++;
+    foodSetupDirtyRef.current = true;
+    setFoodSetupDirty(true);
   };
-  const updateFoodSettings = async (next) => {
+  const editFoodSettings = (next) => {
     setFoodSettings(next);
-    setSync({ state: "syncing", msg: "Saving food settings…" });
-    try {
-      await dbWrite("foodSettings", next);
-      setSync({ state: "saved", msg: "Food settings synced", ts: Date.now() });
-    } catch (err) {
-      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
-      console.error(err);
-      setSync({ state: "error", msg: err.message || "Food settings save failed" });
-    }
+    foodSetupRevision.current++;
+    foodSetupDirtyRef.current = true;
+    setFoodSetupDirty(true);
   };
-  const updateMealTemplates = async (next) => {
+  const editMealTemplates = (next) => {
     setMealTemplates(next);
-    setSync({ state: "syncing", msg: "Saving meal templates…" });
-    try {
-      await dbWrite("mealTemplates", next);
-      setSync({ state: "saved", msg: "Meal templates synced", ts: Date.now() });
-    } catch (err) {
-      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
-      console.error(err);
-      setSync({ state: "error", msg: err.message || "Meal templates save failed" });
-    }
+    foodSetupRevision.current++;
+    foodSetupDirtyRef.current = true;
+    setFoodSetupDirty(true);
   };
-  const updateMealTypes = async (next) => {
+  const editMealTypes = (next) => {
     setMealTypes(next);
-    setSync({ state: "syncing", msg: "Saving meal types…" });
+    foodSetupRevision.current++;
+    foodSetupDirtyRef.current = true;
+    setFoodSetupDirty(true);
+  };
+  const saveFoodSetup = async () => {
+    if (!foodSetupDirty || foodSetupSaveLock.current) return false;
+    foodSetupSaveLock.current = true;
+    const revision = foodSetupRevision.current;
+    const snapshot = JSON.parse(JSON.stringify({ foodItems, foodSettings, mealTemplates, mealTypes }));
+    setFoodSetupSaving(true);
+    setSync({ state: "syncing", msg: "Saving food setup…" });
     try {
-      await dbWrite("mealTypes", next);
-      setSync({ state: "saved", msg: "Meal types synced", ts: Date.now() });
+      for (const [key, value] of Object.entries(snapshot)) {
+        if (JSON.stringify(value) === JSON.stringify(savedFoodSetup.current[key])) continue;
+        await dbWrite(key, value);
+        savedFoodSetup.current = { ...savedFoodSetup.current, [key]: value };
+      }
+      if (foodSetupRevision.current === revision) {
+        foodSetupDirtyRef.current = false;
+        setFoodSetupDirty(false);
+      }
+      setSync({ state: "saved", msg: "Food setup saved", ts: Date.now() });
+      return true;
     } catch (err) {
-      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return false; }
       console.error(err);
-      setSync({ state: "error", msg: err.message || "Meal types save failed" });
+      setSync({ state: "error", msg: err.message || "Food setup save failed" });
+      return false;
+    } finally {
+      foodSetupSaveLock.current = false;
+      setFoodSetupSaving(false);
     }
   };
-  const updateFoodEntries = async (next) => {
+  const discardFoodSetup = () => {
+    if (foodSetupSaveLock.current) return;
+    const snapshot = JSON.parse(JSON.stringify(savedFoodSetup.current));
+    setFoodItems(snapshot.foodItems);
+    setFoodSettings(snapshot.foodSettings);
+    setMealTemplates(snapshot.mealTemplates);
+    setMealTypes(snapshot.mealTypes);
+    foodSetupRevision.current++;
+    foodSetupDirtyRef.current = false;
+    setFoodSetupDirty(false);
+  };
+  const editFoodEntries = (next) => {
     setFoodEntries(next);
+    foodLogRevision.current++;
+    foodLogDirtyRef.current = true;
+    setFoodLogDirty(true);
+  };
+  const saveFoodLog = async () => {
+    if (!foodLogDirty || foodLogSaveLock.current) return false;
+    foodLogSaveLock.current = true;
+    const revision = foodLogRevision.current;
+    const snapshot = JSON.parse(JSON.stringify(foodEntries));
+    setFoodLogSaving(true);
     setSync({ state: "syncing", msg: "Saving food log…" });
     try {
-      await dbWrite("foodEntries", next);
+      await dbWrite("foodEntries", snapshot);
+      savedFoodEntries.current = snapshot;
+      if (foodLogRevision.current === revision) {
+        foodLogDirtyRef.current = false;
+        setFoodLogDirty(false);
+      }
       setSync({ state: "saved", msg: "Food log synced", ts: Date.now() });
+      return true;
     } catch (err) {
-      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return false; }
       console.error(err);
       setSync({ state: "error", msg: err.message || "Food log save failed" });
+      return false;
+    } finally {
+      foodLogSaveLock.current = false;
+      setFoodLogSaving(false);
     }
+  };
+  const discardFoodLog = () => {
+    if (foodLogSaveLock.current) return;
+    setFoodEntries(JSON.parse(JSON.stringify(savedFoodEntries.current)));
+    foodLogRevision.current++;
+    foodLogDirtyRef.current = false;
+    setFoodLogDirty(false);
   };
   // Writes a day's computed nutrient totals into whichever habit fields are
   // linked (foodSettings.links), merging into that date's habit entry and
@@ -3654,7 +3761,7 @@ export default function App() {
     const links = foodSettings?.links || {};
     const updates = {};
     FOOD_NUTRIENTS.forEach(n => { if (links[n.k]) updates[links[n.k]] = Math.round(totals[n.k]); });
-    if (!Object.keys(updates).length) return;
+    if (!Object.keys(updates).length) return false;
     const existing = entries.find(e => e.date === date) || { date, isHoliday:false };
     const merged = { ...existing, ...updates };
     const { score, criteria, met, total } = calcScore(merged, schema);
@@ -3669,10 +3776,12 @@ export default function App() {
     try {
       await dbWrite("entries", nextEntries);
       setSync({ state: "saved", msg: `Synced · ${nextEntries.length} entries`, ts: Date.now() });
+      return true;
     } catch (err) {
-      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
+      if (err && err.code === 401) { setAuth(""); setLocked(true); return false; }
       console.error(err);
       setSync({ state: "error", msg: err.message || "Habit field sync failed" });
+      return false;
     }
   };
 
@@ -3857,13 +3966,40 @@ export default function App() {
             <span className="ht-date-pill">{fmtShort(getToday())}</span>
             <button onClick={() => setInfo(true)} className="ht-info-btn" title="How scoring works">i</button>
             <button
-              onClick={() => { if (confirm("Lock the app? You'll need the passcode to unlock.")) { setAuth(""); setLocked(true); } }}
+              onClick={() => {
+                if (foodSetupDirty || foodLogDirty) { alert("Save or discard unsaved food changes before locking the app."); return; }
+                if (confirm("Lock the app? You'll need the passcode to unlock.")) { setAuth(""); setLocked(true); }
+              }}
               className="ht-info-btn" title="Lock"
               style={{ borderColor: `${C.muted}66`, background: `${C.muted}11`, color: C.muted, fontStyle:"normal", fontFamily:"inherit" }}
             >🔒</button>
           </div>
         </div>
       </header>
+
+      {foodSetupDirty && (
+        <div style={{
+          maxWidth:1400, margin:"12px auto 0", padding:"12px 16px",
+          display:"flex", gap:12, alignItems:"center", flexWrap:"wrap",
+          background:`${C.amber}12`, border:`1px solid ${C.amber}44`, borderRadius:12,
+        }}>
+          <span style={{ color:C.amber, fontSize:13, fontWeight:700, flex:"1 1 220px" }}>
+            ● Unsaved food setup changes — items, templates, meal types, or targets
+          </span>
+          <button onClick={() => { if (confirm("Discard all unsaved food setup changes?")) discardFoodSetup(); }}
+            disabled={foodSetupSaving} className="ht-chip" style={{
+              padding:"8px 14px", borderRadius:9, border:`1px solid ${C.border2}`,
+              background:C.card3, color:C.muted, fontWeight:700, fontSize:12,
+              cursor:foodSetupSaving ? "wait" : "pointer", fontFamily:"inherit",
+            }}>Discard</button>
+          <button onClick={saveFoodSetup} disabled={foodSetupSaving} className="ht-cta" style={{
+            padding:"8px 16px", borderRadius:9, border:"none",
+            background:foodSetupSaving ? C.muted : `linear-gradient(135deg,${C.violet},${C.purple})`,
+            color:C.white, fontWeight:800, fontSize:12,
+            cursor:foodSetupSaving ? "wait" : "pointer", fontFamily:"inherit",
+          }}>{foodSetupSaving ? "Saving food setup…" : "💾 Save Food Setup"}</button>
+        </div>
+      )}
 
       {bootError && (
         <div style={{
@@ -3879,13 +4015,14 @@ export default function App() {
       <main className="ht-main">
         {tab==="dashboard" && <Dashboard scored={scored} schema={schema} onGoLog={() => { onDateChange(getToday()); setTab("log"); }} onPickDate={pickDate}/>}
         {tab==="log" && <LogEntry form={form} setForm={setForm} live={live} schema={schema} onDateChange={onDateChange} onSave={onSave} saved={saved} onQuickFill={onQuickFill} hasYesterday={!!yesterday}
-          foodItems={foodItems} mealTemplates={mealTemplates} mealTypes={mealTypes} foodEntries={foodEntries} onChangeFoodEntries={updateFoodEntries} foodSettings={foodSettings} onApplyFoodLinks={applyFoodTotalsToHabits}/>}
+          foodItems={foodItems} mealTemplates={mealTemplates} mealTypes={mealTypes} foodEntries={foodEntries} onChangeFoodEntries={editFoodEntries} foodSettings={foodSettings} onApplyFoodLinks={applyFoodTotalsToHabits}
+          foodLogDirty={foodLogDirty} foodLogSaving={foodLogSaving} onSaveFoodLog={saveFoodLog} onDiscardFoodLog={discardFoodLog}/>}
         {tab==="history" && <History scored={scored} schema={schema} onPick={(e) => { setForm({ ...DFLT(), ...normalizeEntry(e, schema) }); setTab("log"); }}/>}
         {tab==="engine" && <Engine schema={schema} setSchema={updateSchema} entries={entries} onImport={onImport}
-          foodItems={foodItems} onChangeFoodItems={updateFoodItems} mealTemplates={mealTemplates} onChangeMealTemplates={updateMealTemplates}
-          mealTypes={mealTypes} onChangeMealTypes={updateMealTypes}/>}
+          foodItems={foodItems} onChangeFoodItems={editFoodItems} mealTemplates={mealTemplates} onChangeMealTemplates={editMealTemplates}
+          mealTypes={mealTypes} onChangeMealTypes={editMealTypes}/>}
         {tab==="settings" && <Settings theme={theme} onChange={updateTheme} onReset={resetTheme}
-          schema={schema} foodSettings={foodSettings} onChangeFoodSettings={updateFoodSettings}/>}
+          schema={schema} foodSettings={foodSettings} onChangeFoodSettings={editFoodSettings}/>}
       </main>
 
       <footer style={{ textAlign:"center", padding:"24px 16px 12px", color:C.muted2, fontSize:11 }}>
