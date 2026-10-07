@@ -14,8 +14,9 @@ import {
  */
 const SHEETS_URL = "https://script.google.com/macros/s/AKfycby0sSHdVT7CpBk2JWcIxXdzflMH8Xbj23v05cEu9lGAGFC1kJh51JKkaMB_Xvj0Gt8LaQ/exec";
 const AUTH_KEY = "ht_auth_v1";
-const getAuth = () => { try { return localStorage.getItem(AUTH_KEY) || ""; } catch { return ""; } };
-const setAuth = (v) => { try { v ? localStorage.setItem(AUTH_KEY, v) : localStorage.removeItem(AUTH_KEY); } catch {} };
+let sessionAuth = "";
+const getAuth = () => { try { return sessionAuth || localStorage.getItem(AUTH_KEY) || ""; } catch { return sessionAuth; } };
+const setAuth = (v) => { sessionAuth = v || ""; try { v ? localStorage.setItem(AUTH_KEY, v) : localStorage.removeItem(AUTH_KEY); } catch {} };
 class UnauthorizedError extends Error { constructor() { super("unauthorized"); this.code = 401; } }
 
 // Apps Script sometimes serves an HTML "warm up" interstitial for the first
@@ -48,6 +49,7 @@ async function dbFetchAll() {
   const url = SHEETS_URL + "?k=" + encodeURIComponent(getAuth());
   const json = await fetchJsonWithRetry(url, { method: "GET", redirect: "follow" });
   if (json && json.error === "unauthorized") throw new UnauthorizedError();
+  if (json && json.error) throw new Error(`Apps Script: ${json.error}`);
   return {
     entries: Array.isArray(json.entries) ? json.entries : [],
     schema:  Array.isArray(json.schema)  ? json.schema  : null,
@@ -62,7 +64,15 @@ async function dbFetchAll() {
   };
 }
 
-async function dbWrite(key, value) {
+let writeQueue = Promise.resolve();
+function dbWrite(key, value) {
+  const snapshot = JSON.parse(JSON.stringify(value));
+  const pending = writeQueue.then(() => performDbWrite(key, snapshot));
+  writeQueue = pending.catch(() => {});
+  return pending;
+}
+
+async function performDbWrite(key, value) {
   // text/plain avoids CORS preflight; Apps Script still reads e.postData.contents
   const json = await fetchJsonWithRetry(SHEETS_URL, {
     method: "POST",
@@ -72,6 +82,7 @@ async function dbWrite(key, value) {
   });
   if (json && json.error === "unauthorized") throw new UnauthorizedError();
   if (json && json.error) throw new Error(`Apps Script: ${json.error}`);
+  if (!json || json.ok !== true) throw new Error("Sheet did not confirm the save");
   return json;
 }
 
@@ -1166,7 +1177,7 @@ function TargetBadge({ cfg, value }) {
   );
 }
 
-function LogEntry({ form, setForm, live, schema, onDateChange, onSave, saved, onQuickFill, hasYesterday,
+function LogEntry({ form, setForm, live, schema, onDateChange, onSave, saved, entrySaving, onQuickFill, hasYesterday,
   foodItems, mealTemplates, mealTypes, foodEntries, onChangeFoodEntries, foodSettings, onApplyFoodLinks,
   foodLogDirty, foodLogSaving, onSaveFoodLog, onDiscardFoodLog }) {
   const f = (k, v) => setForm(p => ({ ...p, [k]: v }));
@@ -1273,7 +1284,7 @@ function LogEntry({ form, setForm, live, schema, onDateChange, onSave, saved, on
         })}
       </div>
 
-      <button onClick={onSave} className="ht-save" style={{
+      <button type="button" onClick={onSave} disabled={entrySaving} className="ht-save" style={{
         gridColumn:"1 / -1",
         width:"100%", padding:18, borderRadius:14, border:"none", cursor:"pointer",
         fontWeight:800, fontSize:16, color:C.white, fontFamily:"inherit", letterSpacing:.5,
@@ -1282,7 +1293,7 @@ function LogEntry({ form, setForm, live, schema, onDateChange, onSave, saved, on
         boxShadow: saved ? `0 0 24px ${C.green}66` : `0 4px 16px ${C.purple}55`,
         transform: saved ? "scale(1.02)" : "scale(1)",
       }}>
-        {saved ? "✓ Saved!" : "💾 Save Entry"}
+        {entrySaving ? "Saving…" : saved ? "✓ Saved!" : "💾 Save Entry"}
       </button>
 
       {/* Food tracking for the same day being logged above */}
@@ -2681,9 +2692,8 @@ function FoodSettingsCard({ schema, settings, onChange }) {
       <Label accent={C.purple}>🎯 Daily Targets & Habit Linking</Label>
       <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
         Set your daily nutrient targets. Optionally link a nutrient to an existing habit field —
-        from the Log tab's Food Tracking section, hitting "Sync Linked Habit Fields" will write that
-          day's total into the linked field so it factors into your score, with no double entry.
-          Target and link edits stay pending until you choose Save Food Setup.
+        from the Log tab, "Copy Totals to Habit Draft" fills the linked fields without saving.
+        Click Save Entry to store them. Target and link edits require Save Food Setup.
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))", gap:14 }}>
         {FOOD_NUTRIENTS.map(n => (
@@ -3065,14 +3075,10 @@ function DailyFoodLogPanel({ date, schema, foodItems, mealTemplates, mealTypes, 
   const linkedCount = FOOD_NUTRIENTS.filter(n => links[n.k]).length;
 
   const sync = async () => {
-    if (foodLogDirty && !(await onSaveFoodLog())) {
-      setStatus("Food log was not saved; linked habit fields were not synced.");
-      return;
-    }
     const applied = await onApplyLinks(date, totals);
     setStatus(applied
-      ? `✓ Synced ${linkedCount} linked habit field${linkedCount>1?"s":""} for ${date}`
-      : linkedCount ? "Could not sync linked habit fields; check the sync status above." : "No nutrients are linked yet (see Settings → Food Targets & Habit Linking)."
+      ? `Copied ${linkedCount} linked habit field${linkedCount>1?"s":""}. Click Save Entry and Save Food Log to persist your changes.`
+      : linkedCount ? "Could not copy linked habit fields." : "No nutrients are linked yet (see Settings → Food Targets & Habit Linking)."
     );
   };
 
@@ -3185,7 +3191,7 @@ function DailyFoodLogPanel({ date, schema, foodItems, mealTemplates, mealTypes, 
             color:C.white, fontWeight:700, fontSize:13,
             cursor: linkedCount ? "pointer" : "not-allowed", fontFamily:"inherit",
             boxShadow: linkedCount ? `0 4px 12px ${C.purple}55` : "none",
-          }}>🔗 Sync Linked Habit Fields</button>
+          }}>🔗 Copy Totals to Habit Draft</button>
           {status && <span style={{ fontSize:12, color:C.muted }}>{status}</span>}
         </div>
       </Card>
@@ -3319,7 +3325,7 @@ function Settings({ theme, onChange, onReset, schema, foodSettings, onChangeFood
       <Card>
         <Label accent={C.purple}>🎨 Theme</Label>
         <div style={{ fontSize:13, color:C.text, lineHeight:1.6 }}>
-          Customise the palette used everywhere. Changes are saved to the Sheet so they sync across devices.
+          Preview palette edits immediately. Click Save Theme to store them in the Sheet.
         </div>
         <div>
           <Label>Quick Presets</Label>
@@ -3443,6 +3449,7 @@ function PasscodeGate({ onUnlock }) {
         setErr("Wrong passcode");
         return;
       }
+      if (json && json.error) throw new Error(json.error);
       onUnlock(pc);
     } catch (e) {
       setErr(e.message || "Could not verify");
@@ -3516,6 +3523,45 @@ function PasscodeGate({ onUnlock }) {
   );
 }
 
+function useManualSetting(key, value, apply, onError, setSync) {
+  const baseline = useRef(value);
+  const revision = useRef(0);
+  const busy = useRef(false);
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const load = (next) => { baseline.current = next; apply(next); setDirty(false); };
+  const edit = (next) => { revision.current++; apply(next); setDirty(true); };
+  const discard = () => { if (!busy.current) { revision.current++; apply(baseline.current); setDirty(false); } };
+  const save = async () => {
+    if (busy.current) return;
+    busy.current = true;
+    setSaving(true);
+    const stamp = revision.current;
+    const snapshot = JSON.parse(JSON.stringify(value));
+    setSync({ state:"syncing", msg:`Saving ${key}…` });
+    try {
+      await dbWrite(key, snapshot);
+      baseline.current = snapshot;
+      if (stamp === revision.current) setDirty(false);
+      setSync({ state:"saved", msg:`${key} saved`, ts:Date.now() });
+    } catch (err) { onError(err); }
+    finally { busy.current = false; setSaving(false); }
+  };
+  return { dirty, saving, load, edit, discard, save };
+}
+
+function ManualSaveBar({ title, draft }) {
+  if (!draft.dirty) return null;
+  const buttonStyle = { padding:"10px 16px", borderRadius:9, border:`1px solid ${C.border2}`, background:C.card3, color:C.text, fontWeight:700, cursor:draft.saving ? "wait" : "pointer", flexShrink:0 };
+  return <div style={{ margin:"12px auto", maxWidth:1400, padding:16, borderRadius:12, background:C.card, border:`1px solid ${C.amber}44` }}>
+    <div style={{ display:"flex", gap:12, alignItems:"center", flexWrap:"wrap" }}>
+      <span style={{ color:C.amber, flex:1 }}>● Unsaved {title} changes</span>
+      <button type="button" style={buttonStyle} onClick={draft.discard} disabled={draft.saving}>Discard</button>
+      <button type="button" style={{...buttonStyle, background:C.violet, color:C.white}} onClick={draft.save} disabled={draft.saving}>{draft.saving ? "Saving…" : `💾 Save ${title}`}</button>
+    </div>
+  </div>;
+}
+
 export default function App() {
   const [tab, setTab] = useState("dashboard");
   const [menuOpen, setMenuOpen] = useState(false);
@@ -3558,6 +3604,26 @@ export default function App() {
 
   // Re-trigger boot fetch when the user unlocks.
   const [bootNonce, setBootNonce] = useState(0);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [reauthOpen, setReauthOpen] = useState(false);
+  const [entrySaving, setEntrySaving] = useState(false);
+  const entrySaveLock = useRef(false);
+  const reportSaveError = (err) => {
+    if (err?.code === 401) setAuthRequired(true);
+    setSync({ state:"error", msg:err?.code === 401
+      ? "Save rejected — verify passcode and retry. Your drafts are preserved."
+      : err.message || "Save failed — draft preserved" });
+  };
+  const applyThemeDraft = (next) => {
+    setTheme(next); Object.assign(C, next); setThemeVersion(v => v + 1);
+  };
+  const themeDraft = useManualSetting("theme", theme, applyThemeDraft, reportSaveError, setSync);
+  const schemaDraft = useManualSetting("schema", schema, setSchema, reportSaveError, setSync);
+  const habitDirty = useMemo(() => {
+    const existing = entries.find(e => e.date === form.date);
+    const baseline = { ...DFLT(), ...(existing ? normalizeEntry(existing, schema) : {}), date:form.date };
+    return ["isHoliday", ...schema.map(f => f.id)].some(key => form[key] !== baseline[key]);
+  }, [entries, form, schema]);
 
   // Load EVERYTHING from the sheet on mount.
   useEffect(() => {
@@ -3576,16 +3642,11 @@ export default function App() {
         // Normalise time fields immediately so <input type="time"> never sees
         // a Date/fraction round-tripped from Sheets.
         setEntries(e.map(en => normalizeEntry(en, effSchema)));
-        if (s && s.length) setSchema(s);
-        else {
-          // First-ever boot: push default schema to the sheet so all devices share it.
-          try { await dbWrite("schema", DEFAULT_SCHEMA); } catch {}
-        }
+        if (s && s.length) schemaDraft.load(s);
+        else schemaDraft.edit(DEFAULT_SCHEMA);
         if (t) {
           const merged = { ...DEFAULT_THEME, ...t };
-          setTheme(merged);
-          Object.assign(C, merged);
-          setThemeVersion(v => v + 1);
+          themeDraft.load(merged);
         }
         // Food tracking: purely additive, defaults keep existing data/UI untouched.
         const loadedFoodSetup = {
@@ -3624,30 +3685,16 @@ export default function App() {
   }, [locked, bootNonce]);
 
   useEffect(() => {
-    if (!foodSetupDirty && !foodLogDirty) return;
+    if (!foodSetupDirty && !foodLogDirty && !habitDirty && !schemaDraft.dirty && !themeDraft.dirty) return;
     const warnBeforeLeaving = (event) => {
       event.preventDefault();
       event.returnValue = "";
     };
     window.addEventListener("beforeunload", warnBeforeLeaving);
     return () => window.removeEventListener("beforeunload", warnBeforeLeaving);
-  }, [foodSetupDirty, foodLogDirty]);
+  }, [foodSetupDirty, foodLogDirty, habitDirty, schemaDraft.dirty, themeDraft.dirty]);
 
-  // Mutate global palette + persist theme to sheet.
-  const updateTheme = async (next) => {
-    setTheme(next);
-    Object.assign(C, next);
-    setThemeVersion(v => v + 1);
-    setSync({ state: "syncing", msg: "Saving theme…" });
-    try {
-      await dbWrite("theme", next);
-      setSync({ state: "saved", msg: "Theme synced", ts: Date.now() });
-    } catch (err) {
-      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
-      console.error(err);
-      setSync({ state: "error", msg: err.message || "Theme save failed" });
-    }
-  };
+  const updateTheme = themeDraft.edit;
   const resetTheme = () => updateTheme(DEFAULT_THEME);
 
   const editFoodItems = (next) => {
@@ -3694,9 +3741,7 @@ export default function App() {
       setSync({ state: "saved", msg: "Food setup saved", ts: Date.now() });
       return true;
     } catch (err) {
-      if (err && err.code === 401) { setAuth(""); setLocked(true); return false; }
-      console.error(err);
-      setSync({ state: "error", msg: err.message || "Food setup save failed" });
+      reportSaveError(err);
       return false;
     } finally {
       foodSetupSaveLock.current = false;
@@ -3737,9 +3782,7 @@ export default function App() {
       setSync({ state: "saved", msg: "Food log synced", ts: Date.now() });
       return true;
     } catch (err) {
-      if (err && err.code === 401) { setAuth(""); setLocked(true); return false; }
-      console.error(err);
-      setSync({ state: "error", msg: err.message || "Food log save failed" });
+      reportSaveError(err);
       return false;
     } finally {
       foodLogSaveLock.current = false;
@@ -3753,73 +3796,47 @@ export default function App() {
     foodLogDirtyRef.current = false;
     setFoodLogDirty(false);
   };
-  // Writes a day's computed nutrient totals into whichever habit fields are
-  // linked (foodSettings.links), merging into that date's habit entry and
-  // re-persisting via the SAME habit `entries` save path as onSave — so it
-  // recomputes score/criteria exactly like a normal log entry would.
-  const applyFoodTotalsToHabits = async (date, totals) => {
+  const applyFoodTotalsToHabits = (date, totals) => {
     const links = foodSettings?.links || {};
     const updates = {};
     FOOD_NUTRIENTS.forEach(n => { if (links[n.k]) updates[links[n.k]] = Math.round(totals[n.k]); });
-    if (!Object.keys(updates).length) return false;
-    const existing = entries.find(e => e.date === date) || { date, isHoliday:false };
-    const merged = { ...existing, ...updates };
-    const { score, criteria, met, total } = calcScore(merged, schema);
-    const finalEntry = { ...merged, score, criteria, met, total };
-    const nextEntries = [...entries.filter(e => e.date !== date), finalEntry].sort((a,b) => a.date.localeCompare(b.date));
-    setEntries(nextEntries);
-    // The Log tab's `form` is a separate working copy of the entry being
-    // edited — without this, the linked field visibly stayed unchanged and a
-    // later "Save Entry" would overwrite entries[] with the stale form value.
-    if (form.date === date) setForm(f => ({ ...f, ...updates }));
-    setSync({ state: "syncing", msg: "Syncing linked habit fields…" });
-    try {
-      await dbWrite("entries", nextEntries);
-      setSync({ state: "saved", msg: `Synced · ${nextEntries.length} entries`, ts: Date.now() });
-      return true;
-    } catch (err) {
-      if (err && err.code === 401) { setAuth(""); setLocked(true); return false; }
-      console.error(err);
-      setSync({ state: "error", msg: err.message || "Habit field sync failed" });
-      return false;
-    }
+    if (!Object.keys(updates).length || form.date !== date) return false;
+    setForm(f => ({ ...f, ...updates }));
+    return true;
   };
 
-  // Persist schema to sheet only when user actually edits it (via updateSchema).
-  const updateSchema = async (next) => {
-    setSchema(next);
-    setSync({ state: "syncing", msg: "Saving schema…" });
-    try {
-      await dbWrite("schema", next);
-      setSync({ state: "saved", msg: "Schema synced", ts: Date.now() });
-    } catch (err) {
-      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
-      console.error(err);
-      setSync({ state: "error", msg: err.message || "Schema save failed" });
-    }
-  };
+  const updateSchema = schemaDraft.edit;
 
   const onDateChange = d => {
+    if (entrySaveLock.current) return;
+    if (habitDirty && d !== form.date && !confirm("Discard unsaved habit entry changes and change date?")) return;
     const ex = entries.find(e => e.date === d);
     setForm(ex ? { ...DFLT(), ...normalizeEntry(ex, schema) } : { ...DFLT(), date: d });
   };
 
   const onSave = async () => {
+    if (entrySaveLock.current) return;
+    if (schemaDraft.dirty) {
+      setSync({ state:"error", msg:"Save Habit Settings before saving entries." });
+      return;
+    }
+    entrySaveLock.current = true;
+    setEntrySaving(true);
     const { score, criteria, met, total } = calcScore(form, schema);
     const entry = { ...form, score, criteria, met, total };
     const updated = [...entries.filter(e => e.date !== form.date), entry].sort((a, b) => a.date.localeCompare(b.date));
-    setEntries(updated);
     setSync({ state: "syncing", msg: "Saving to Sheet…" });
     try {
       await dbWrite("entries", updated);
+      setEntries(updated);
       setSaved(true);
       setSync({ state: "saved", msg: `Synced · ${updated.length} entries`, ts: Date.now() });
-      setTimeout(() => { setSaved(false); setTab("dashboard"); }, 1200);
+      setTimeout(() => setSaved(false), 1200);
     } catch (err) {
-      if (err && err.code === 401) { setAuth(""); setLocked(true); return; }
-      console.error(err);
-      setSync({ state: "error", msg: err.message || "Save failed" });
-      alert(`Save FAILED — not stored in Sheet.\n\n${err.message || err}\n\nFix the Apps Script and try again.`);
+      reportSaveError(err);
+    } finally {
+      entrySaveLock.current = false;
+      setEntrySaving(false);
     }
   };
 
@@ -3835,21 +3852,26 @@ export default function App() {
   }, [entries]);
 
   const onImport = async (mergedEntries) => {
+    if (schemaDraft.dirty) throw new Error("Save Habit Settings before importing entries.");
+    if (entrySaveLock.current) throw new Error("An entry save is already in progress. Try again after it finishes.");
+    entrySaveLock.current = true;
+    setEntrySaving(true);
     // Re-score every entry with current schema, then write to Sheet.
     const rescored = mergedEntries.map(e => {
       const { score, criteria, met, total } = calcScore(e, schema);
       return { ...e, score, criteria, met, total };
     });
-    setEntries(rescored);
     setSync({ state: "syncing", msg: `Importing ${rescored.length} entries…` });
     try {
       await dbWrite("entries", rescored);
+      setEntries(rescored);
       setSync({ state: "saved", msg: `Imported · ${rescored.length} entries`, ts: Date.now() });
     } catch (err) {
-      if (err && err.code === 401) { setAuth(""); setLocked(true); throw err; }
-      console.error(err);
-      setSync({ state: "error", msg: err.message || "Import failed" });
+      reportSaveError(err);
       throw err;
+    } finally {
+      entrySaveLock.current = false;
+      setEntrySaving(false);
     }
   };
 
@@ -3899,6 +3921,17 @@ export default function App() {
   return (
     <div style={{ background:C.bg, minHeight:"100vh", color:C.text, paddingBottom:60 }}>
       <GlobalStyles/>
+      {reauthOpen && (
+        <div role="dialog" aria-modal="true" aria-label="Verify passcode" style={{ position:"fixed", inset:0, zIndex:1000, background:C.bg, overflowY:"auto" }}>
+          <button type="button" onClick={() => setReauthOpen(false)} style={{ position:"absolute", right:20, top:20, zIndex:1 }}>Cancel — keep editing</button>
+          <PasscodeGate onUnlock={pc => {
+            setAuth(pc);
+            setAuthRequired(false);
+            setReauthOpen(false);
+            setSync({ state:"idle", msg:"Passcode verified. Click Save to retry your pending changes." });
+          }}/>
+        </div>
+      )}
       <InfoModal open={info} onClose={() => setInfo(false)} schema={schema}/>
       <DayDetailModal
         open={!!dayDetail}
@@ -3967,7 +4000,7 @@ export default function App() {
             <button onClick={() => setInfo(true)} className="ht-info-btn" title="How scoring works">i</button>
             <button
               onClick={() => {
-                if (foodSetupDirty || foodLogDirty) { alert("Save or discard unsaved food changes before locking the app."); return; }
+                if (foodSetupDirty || foodLogDirty || habitDirty || schemaDraft.dirty || themeDraft.dirty) { alert("Save or discard unsaved changes before locking the app."); return; }
                 if (confirm("Lock the app? You'll need the passcode to unlock.")) { setAuth(""); setLocked(true); }
               }}
               className="ht-info-btn" title="Lock"
@@ -3976,6 +4009,15 @@ export default function App() {
           </div>
         </div>
       </header>
+
+      {authRequired && (
+        <Card style={{ maxWidth:1400, margin:"12px auto" }}>
+          <span style={{ color:C.red }}>Save authorization failed. Your edits are still here; no changes were confirmed saved.</span>
+          <button type="button" onClick={() => setReauthOpen(true)}>Verify passcode to retry</button>
+        </Card>
+      )}
+      <ManualSaveBar title="Habit Settings" draft={schemaDraft}/>
+      <ManualSaveBar title="Theme" draft={themeDraft}/>
 
       {foodSetupDirty && (
         <div style={{
@@ -4014,7 +4056,7 @@ export default function App() {
 
       <main className="ht-main">
         {tab==="dashboard" && <Dashboard scored={scored} schema={schema} onGoLog={() => { onDateChange(getToday()); setTab("log"); }} onPickDate={pickDate}/>}
-        {tab==="log" && <LogEntry form={form} setForm={setForm} live={live} schema={schema} onDateChange={onDateChange} onSave={onSave} saved={saved} onQuickFill={onQuickFill} hasYesterday={!!yesterday}
+        {tab==="log" && <LogEntry form={form} setForm={setForm} live={live} schema={schema} onDateChange={onDateChange} onSave={onSave} saved={saved} entrySaving={entrySaving} onQuickFill={onQuickFill} hasYesterday={!!yesterday}
           foodItems={foodItems} mealTemplates={mealTemplates} mealTypes={mealTypes} foodEntries={foodEntries} onChangeFoodEntries={editFoodEntries} foodSettings={foodSettings} onApplyFoodLinks={applyFoodTotalsToHabits}
           foodLogDirty={foodLogDirty} foodLogSaving={foodLogSaving} onSaveFoodLog={saveFoodLog} onDiscardFoodLog={discardFoodLog}/>}
         {tab==="history" && <History scored={scored} schema={schema} onPick={(e) => { setForm({ ...DFLT(), ...normalizeEntry(e, schema) }); setTab("log"); }}/>}
