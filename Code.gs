@@ -773,6 +773,21 @@ function doGet(e) {
     const auth = e && e.parameter && e.parameter.k;
     if (!checkAuth_(auth)) return unauthorized_();
     createBackupIfDue_(); // cheap no-op after the first request of the day
+    // Opt-in, authenticated migration trigger — lets you run the one-time
+    // v2→v3 food-data migration by visiting the deployed URL with
+    // `&migrate=1` when the Apps Script editor's Run dropdown won't list
+    // migrateFoodDataToStructuredSheets_ (e.g. a stale/cached editor UI).
+    // Safe to hit more than once; never deletes the old Meta/FoodEntries data.
+    if (e && e.parameter && e.parameter.migrate === "1") {
+      const lock = LockService.getScriptLock();
+      lock.waitLock(10000);
+      try {
+        migrateFoodDataToStructuredSheets_();
+        return jsonOut_({ ok: true, migrated: true });
+      } finally {
+        lock.releaseLock();
+      }
+    }
     const lock = LockService.getScriptLock();
     lock.waitLock(10000);
     try {
